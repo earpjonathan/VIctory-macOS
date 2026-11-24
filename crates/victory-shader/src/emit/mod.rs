@@ -225,6 +225,8 @@ mod flow_tests;
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_store_tests;
 mod lower;
 mod rect;
 pub use container::sign as sign_container;

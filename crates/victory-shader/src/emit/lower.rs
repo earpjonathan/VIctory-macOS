@@ -9149,11 +9149,8 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to be to a float format (the
+            // console converts by the view's format).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9162,12 +9159,20 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            // The data VGPRs hold the enabled channels only, in channel
+            // order. The console writes the others as 0 (the ISA guides'
+            // DMASK: "missing components get 0"; LLVM trims zero channels
+            // from image stores on the same grounds), so the host's store
+            // writes all four: DXIL's validator wants typed UAV stores to
+            // write every channel (with a 0xF mask) anyway.
+            let zero = self.s.m.f32(0);
+            let mut vals = vec![zero; 4];
+            for (k, ch) in (0..4u8).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                let k = k as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[usize::from(ch)] = if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
@@ -9178,7 +9183,7 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
