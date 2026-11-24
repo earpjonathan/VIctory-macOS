@@ -9146,8 +9146,32 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if store {
-            if name != "image_store" {
-                return Err("an image store to a mip level");
+            if name == "image_store_mip" {
+                // The level (the address after the coordinates) counts from
+                // the descriptor's base level. shortcut: a host UAV views a
+                // single level, taken to be that base level (the one the
+                // title made the view for). Level 0 is the view's own;
+                // another would need a view per level, which the title's
+                // heap does not hold, so it stops the program, as does a
+                // level known only when the program runs.
+                let r = *regs
+                    .get(if *a16 { coords / 2 } else { coords })
+                    .ok_or("an image address")?;
+                let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+                let x = self.i32_of(v)?;
+                let level = self.s.m.int_value(x).map(|w| {
+                    let w = w as u32;
+                    if *a16 {
+                        w >> (16 * (coords as u32 % 2)) & 0xFFFF
+                    } else {
+                        w
+                    }
+                });
+                if level != Some(0) {
+                    return Err("an image store to a mip level other than 0 or unknown");
+                }
+            } else if name != "image_store" {
+                return Err(name);
             }
             // shortcut: stores are taken to be to a float format (the
             // console converts by the view's format).

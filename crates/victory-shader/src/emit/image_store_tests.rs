@@ -18,6 +18,7 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 const IMAGE_STORE: u8 = 0x08;
+const IMAGE_STORE_MIP: u8 = 0x09;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -53,13 +54,29 @@ const fn mimg_2d(op: u8, vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) 
     ]
 }
 
+/// Where the second store's mip level comes from (`image_store_mip`).
+#[derive(Clone, Copy)]
+enum Mip {
+    /// `image_store`: no level.
+    None,
+    /// An inline constant (128 = 0, 129 = 1).
+    Inline(u16),
+    /// Root constant s10, unknown at translation.
+    Computed,
+}
+
 /// Root constants s0..s3: the fill; s4..s7: the data under test; s8, s9:
-/// the texel. s12 is the table of the texture UAV.
-fn program(dmask: u8, d16: bool) -> NativeProgram {
+/// the texel; s10: a mip level. s12 is the table of the texture UAV.
+fn program(dmask: u8, d16: bool, mip: Mip) -> NativeProgram {
     let mut words = vec![s_mov_b32(13, 0x80)]; // s13 = 0: the table's high dword
     words.extend(s_load_dwordx8(16, 12, 0));
     words.push(v_mov_b32(4, 8));
     words.push(v_mov_b32(5, 9));
+    match mip {
+        Mip::None => {}
+        Mip::Inline(k) => words.push(v_mov_b32(6, k)),
+        Mip::Computed => words.push(v_mov_b32(6, 10)),
+    }
     for k in 0..4u8 {
         words.push(v_mov_b32(k, u16::from(k)));
     }
@@ -67,7 +84,11 @@ fn program(dmask: u8, d16: bool) -> NativeProgram {
     for k in 0..4u8 {
         words.push(v_mov_b32(k, u16::from(4 + k)));
     }
-    words.extend(mimg_2d(IMAGE_STORE, 0, 4, 16, dmask, d16));
+    let op = match mip {
+        Mip::None => IMAGE_STORE,
+        _ => IMAGE_STORE_MIP,
+    };
+    words.extend(mimg_2d(op, 0, 4, 16, dmask, d16));
     words.push(S_ENDPGM);
 
     NativeProgram {
@@ -147,8 +168,8 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
 }
 
 /// The program lowered and validated.
-fn build(dmask: u8, d16: bool) -> HostShader {
-    let shader = lower(&program(dmask, d16)).expect("lower");
+fn build(dmask: u8, d16: bool, mip: Mip) -> HostShader {
+    let shader = lower(&program(dmask, d16, mip)).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         let ours = copy[4..20].to_vec();
@@ -230,22 +251,23 @@ fn f16_to_f32(h: u16) -> f32 {
 /// integers.
 const FILL: [u32; 4] = [0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000];
 
-/// Runs each case's shader on the hardware adapter and WARP (each skipped
-/// without an SM 6.6 device) and checks the whole texture.
 fn run(cases: &[Case]) {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let shaders: Vec<_> = cases.iter().map(|c| build(c.dmask, c.d16)).collect();
-    run_shaders(cases, &shaders);
+    run_with(cases, Mip::None);
 }
 
-fn run_shaders(cases: &[Case], shaders: &[HostShader]) {
+/// Runs each case's shader (its second store's level from `mip`) on the
+/// hardware adapter and WARP (each skipped without an SM 6.6 device) and
+/// checks the whole texture.
+fn run_with(cases: &[Case], mip: Mip) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let shaders: Vec<_> = cases.iter().map(|c| build(c.dmask, c.d16, mip)).collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        for (case, shader) in cases.iter().zip(shaders) {
+        for (case, shader) in cases.iter().zip(&shaders) {
             let what = format!(
                 "{label} {:?} dmask {:#x}{}",
                 case.format,
@@ -354,4 +376,48 @@ fn integer_stores_run_on_the_host() {
         });
     }
     run(&cases);
+}
+
+#[test]
+fn mip_stores_to_the_views_level_run_on_the_host() {
+    let cases = [
+        Case {
+            dmask: 0xF,
+            d16: false,
+            format: Format::Rgba32Float,
+            data: FLOATS,
+        },
+        Case {
+            dmask: 0x9,
+            d16: false,
+            format: Format::Rgba32Float,
+            data: FLOATS,
+        },
+        Case {
+            dmask: 0x1,
+            d16: false,
+            format: Format::R32Uint,
+            data: INTS,
+        },
+    ];
+    run_with(&cases, Mip::Inline(128));
+}
+
+#[test]
+fn mip_stores_past_the_views_level_or_computed_stop_the_program() {
+    for mip in [Mip::Inline(129), Mip::Computed] {
+        let Err(e) = lower(&program(0xF, false, mip)) else {
+            panic!("a store to another level lowered");
+        };
+        assert!(
+            matches!(
+                e,
+                ShaderError::Unsupported {
+                    what: "an image store to a mip level other than 0 or unknown",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+    }
 }
