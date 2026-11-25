@@ -3188,6 +3188,13 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
+                let [given, given_bytes, remade, soon] =
+                    [0, 1, 2, 3].map(|i| crate::resource::EVICTIONS[i].swap(0, Ordering::Relaxed));
+                tracing::info!(
+                    "host textures given up: {given} ({:.0} MB); made again after being given up: {remade}, {soon} of them within {} frames",
+                    given_bytes as f64 / 1e6,
+                    crate::resource::SOON_FRAMES,
+                );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::frame::log();
                 log_gpu_times(copy_frames);
