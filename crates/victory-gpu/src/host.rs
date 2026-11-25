@@ -66,10 +66,14 @@ pub(crate) struct Quiet<'a> {
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    /// The direct queue; a new one replaces it when it stops running work
+    /// ([`Host::lost`]).
+    queue: Mutex<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The list every submission ends with, made on first use ([`Mark`]).
+    mark: OnceLock<Option<Mark>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -90,10 +94,90 @@ pub(crate) struct Host {
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded; the event handle is only waited on, and the mark's mapped
+// buffers only used, under `submitted`.
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
+
+/// What shows that a submission ran: a list run last in every submission,
+/// which copies the submission's number from upload memory into read-back
+/// memory. Under D3DMetal, macOS ends a command buffer whose draw holds the
+/// GPU too long (`kIOGPUCommandBufferCallbackErrorHang`: about 50 ms into a
+/// draw whose every pixel runs long), and after some of those the queue
+/// ignores everything submitted to it, presents included
+/// (`kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`), while its fence
+/// still completes and the device is not removed (VIctory-macOS #50). A
+/// list after the ended one in the same submission does not run either.
+/// `WriteBufferImmediate` writes nothing under D3DMetal 4.0 beta 3, so this
+/// is a copy.
+struct Mark {
+    list: ID3D12GraphicsCommandList,
+    _allocator: ID3D12CommandAllocator,
+    _buffers: [ID3D12Resource; 2],
+    /// The number the list copies (upload memory).
+    number: *mut u64,
+    /// Where it lands (read-back memory).
+    seen: *const u64,
+}
+
+impl Mark {
+    fn new(host: &Host) -> windows::core::Result<Mark> {
+        let (number, numbers) = host
+            .mapped_buffer(8, false)
+            .ok_or_else(windows::core::Error::empty)?;
+        let (seen, seen_at) = host
+            .mapped_buffer(8, true)
+            .ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: plain object creation, and a copy between our buffers,
+        // which stay in their states (copy source, copy destination).
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.CopyBufferRegion(&seen, 0, &number, 0, 8);
+            list.Close()?;
+            name(&list, || "submission mark".into());
+            Ok(Mark {
+                list,
+                _allocator: allocator,
+                _buffers: [number, seen],
+                number: numbers.cast(),
+                seen: seen_at.cast_const().cast(),
+            })
+        }
+    }
+
+    /// Sets the number the next run of the list copies. Under the
+    /// submission lock, once the last submission has finished.
+    fn arm(&self, value: u64) {
+        // SAFETY: our mapped upload buffer, which no submission reads now.
+        unsafe { self.number.write_volatile(value) }
+    }
+
+    /// Whether the last run of the list copied `value`.
+    fn saw(&self, value: u64) -> bool {
+        // SAFETY: our mapped read-back buffer.
+        unsafe { self.seen.read_volatile() == value }
+    }
+
+    fn list(&self) -> Option<ID3D12CommandList> {
+        self.list.cast().ok()
+    }
+}
+
+/// Submissions that did not run to their mark, and queues made since to
+/// replace one that stopped running work.
+static LOST: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -271,9 +355,10 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
-            queue,
+            queue: Mutex::new(queue),
             fence,
             submitted: Mutex::new(0),
+            mark: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -1187,6 +1272,94 @@ impl Host {
         }
     }
 
+    /// The queue submissions go to now.
+    fn queue(&self) -> ID3D12CommandQueue {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The list submissions end with ([`Mark`]); `None` if it could not be
+    /// made, and then submissions are not checked.
+    fn mark(&self) -> Option<&Mark> {
+        self.mark
+            .get_or_init(|| {
+                Mark::new(self)
+                    .inspect_err(|e| tracing::warn!(error = %e, "no submission mark: submissions the host GPU drops go unseen"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// After a submission that did not run to its mark: what it drew is
+    /// missing. If the queue no longer runs work, a new queue replaces it,
+    /// and the next present makes its swap chain on that one. Under the
+    /// submission lock.
+    fn lost(&self, submitted: &mut u64, mark: &Mark) {
+        let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if self.runs(submitted, mark) {
+            if lost.is_power_of_two() {
+                tracing::warn!(
+                    lost,
+                    "the host GPU ended a submission before it finished, and what it drew is missing \
+                     (under D3DMetal, macOS ends a command buffer whose draw holds the GPU too long)"
+                );
+            }
+            return;
+        }
+        if let Err(e) = self.replace_queue() {
+            fail(format_args!(
+                "the host queue stopped running work, and no new queue could be made: {e}"
+            ));
+        }
+        if !self.runs(submitted, mark) {
+            fail(format_args!(
+                "the host queue stopped running work, and a new queue does not run it either"
+            ));
+        }
+        let queues = LOST[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if queues.is_power_of_two() {
+            tracing::warn!(
+                lost,
+                queues,
+                "the host queue stopped running work after the GPU ended a submission \
+                 (macOS ignores what is submitted to it): moved to a new queue"
+            );
+        }
+    }
+
+    /// Whether the queue runs work: the mark alone, as a submission of its
+    /// own. Under the submission lock.
+    fn runs(&self, submitted: &mut u64, mark: &Mark) -> bool {
+        *submitted += 1;
+        mark.arm(*submitted);
+        let queue = self.queue();
+        // SAFETY: a closed list; the fence and event are ours.
+        unsafe {
+            queue.ExecuteCommandLists(&[mark.list()]);
+            let waited = queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            match waited {
+                Ok(()) => self.wait_for(*submitted),
+                Err(e) => tracing::warn!(error = %e, "host check not waited for"),
+            }
+        }
+        mark.saw(*submitted)
+    }
+
+    /// A new direct queue in place of the current one. Under the submission
+    /// lock, so no submission is on the old queue.
+    fn replace_queue(&self) -> windows::core::Result<()> {
+        // SAFETY: plain object creation.
+        let queue: ID3D12CommandQueue = unsafe {
+            self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }?;
+        *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = queue;
+        Ok(())
+    }
+
     /// Holds other threads' submissions off until dropped, around the making
     /// of a shader-visible host view heap and its fill with null views
     /// (millions of descriptor copies). Under Wine on D3DMetal, lists other
@@ -1317,35 +1490,56 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        let mark = self.mark();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // Last, the list that shows the submission ran.
+            let mut group = group.to_vec();
+            if let Some(mark) = mark {
+                mark.arm(*submitted);
+                group.push(mark.list());
+            }
+            let queue = self.queue();
             // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
+            let waited = unsafe {
+                queue.ExecuteCommandLists(&group);
+                let waited = queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => self.wait_for(*submitted),
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Ok(()) => {
+                        self.wait_for(*submitted);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        false
+                    }
                 }
+            };
+            if waited
+                && let Some(mark) = mark
+                && !mark.saw(*submitted)
+                // SAFETY: a plain query.
+                && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
+            {
+                self.lost(&mut submitted, mark);
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX).unwrap_or_default());
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i]
                     .notes
                     .lock()
@@ -3064,6 +3258,8 @@ impl SwapChainRetry {
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    /// The queue the swap chain presents on.
+    queue: ID3D12CommandQueue,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -3280,10 +3476,19 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
+        // A swap chain presents on the queue it was made with. Once that
+        // queue stopped running work and was replaced ([`Host::lost`]), the
+        // chain goes first (a window takes one at a time), and a new one is
+        // made for the same window on the new queue.
+        let queue = self.queue();
+        let mut shown = None;
+        if presenter.as_ref().is_some_and(|p| p.queue != queue) {
+            shown = presenter.take().map(|p| p.hwnd);
+        }
         if presenter.is_none() {
-            *presenter = match retry
-                .attempt(Instant::now(), || self.presenter(width, height, format))?
-            {
+            *presenter = match retry.attempt(Instant::now(), || {
+                self.presenter(&queue, shown, width, height, format)
+            })? {
                 Ok(p) => Some(p),
                 Err((step, e)) => {
                     tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
@@ -3421,13 +3626,17 @@ impl Host {
         }
     }
 
+    /// A swap chain on `queue` for `shown`, else for the title's window,
+    /// else for a window of our own.
     fn presenter(
         &self,
+        queue: &ID3D12CommandQueue,
+        shown: Option<HWND>,
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
     ) -> Result<Presenter, (&'static str, windows::core::Error)> {
-        let hwnd = match title_window() {
+        let hwnd = match shown.or_else(title_window) {
             Some(hwnd) => hwnd,
             None => window(width, height).map_err(|e| ("window", e))?,
         };
@@ -3449,7 +3658,7 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .CreateSwapChainForHwnd(queue, hwnd, &desc, None, None)
                 .and_then(|chain| chain.cast::<IDXGISwapChain3>())
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
@@ -3457,6 +3666,7 @@ impl Host {
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
+                queue: queue.clone(),
                 width,
                 height,
                 format,
@@ -4172,5 +4382,337 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod marks {
+    use super::LOST;
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Graphics::Direct3D::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::s;
+
+    /// A submission that ran shows its number where the CPU reads it, so
+    /// that one the host GPU drops can be told apart (VIctory-macOS #50).
+    #[test]
+    fn a_submission_that_ran_shows_its_number() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let mark = host.mark().expect("the mark list");
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        // Under the lock the last submission is the last one marked,
+        // whatever other tests submitted meanwhile.
+        let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            mark.saw(*submitted),
+            "the mark shows submission {}",
+            *submitted
+        );
+    }
+
+    /// Work goes on, on the same fence, once a new queue replaces the
+    /// first, and a queue that runs work passes the check.
+    #[test]
+    fn work_goes_on_on_a_new_queue() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let mark = host.mark().expect("the mark list");
+        let old = host.queue();
+        {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(host.runs(&mut submitted, mark), "the queue runs work");
+            host.replace_queue().unwrap();
+            assert!(host.runs(&mut submitted, mark), "the new queue runs work");
+        }
+        assert!(host.queue() != old, "a new queue");
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(mark.saw(*submitted), "a submission after the change ran");
+    }
+
+    /// A draw over a `width` x `height` target whose pixels each loop `n`
+    /// times, then write `tag` into their own word of a buffer the CPU reads.
+    struct Spin {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+        _target: ID3D12Resource,
+        _rtvs: ID3D12DescriptorHeap,
+        rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        buffer: ID3D12Resource,
+        words: *const u32,
+        width: u32,
+        height: u32,
+    }
+
+    const SPIN: &str = r#"
+RWByteAddressBuffer o : register(u1);
+cbuffer c : register(b0) { uint n; uint tag; uint width; }
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target {
+    uint id = (uint)pos.y * width + (uint)pos.x;
+    uint a = id;
+    for (uint i = 0; i < n; i++) { a = a * 1664525u + 1013904223u; }
+    o.Store(id * 8 + 4, a);
+    o.Store(id * 8, tag);
+    return float4(a & 1, 0, 0, 1);
+}
+"#;
+
+    impl Spin {
+        fn new(host: &super::Host, width: u32, height: u32) -> Spin {
+            use crate::compute::Param;
+            use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+            let blob = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+                let mut code: Option<ID3DBlob> = None;
+                // SAFETY: the source and names outlive the call.
+                unsafe {
+                    D3DCompile(
+                        SPIN.as_ptr().cast(),
+                        SPIN.len(),
+                        s!("spin"),
+                        None,
+                        None,
+                        entry,
+                        target,
+                        0,
+                        0,
+                        &mut code,
+                        None,
+                    )
+                }
+                .unwrap();
+                code.unwrap()
+            };
+            let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+            // SAFETY: the blobs' own bytes.
+            let bytes = |b: &ID3DBlob| unsafe {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: b.GetBufferPointer(),
+                    BytecodeLength: b.GetBufferSize(),
+                }
+            };
+            let device = &host.device;
+            let root = crate::compute::root_signature(
+                device,
+                &[
+                    Param::Uav { register: 1 },
+                    Param::Constants {
+                        register: 0,
+                        count: 3,
+                    },
+                ],
+            )
+            .unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed for the call.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: bytes(&vs),
+                PS: bytes(&ps),
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            // SAFETY: plain object creation with valid descriptions.
+            unsafe {
+                let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
+                let texture = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: u64::from(width),
+                    Height: height,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let mut target: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &texture,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut target,
+                    )
+                    .unwrap();
+                let target = target.unwrap();
+                let rtvs: ID3D12DescriptorHeap = device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+                device.CreateRenderTargetView(&target, None, rtv);
+                let words = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(width * height) * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_CUSTOM,
+                            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &words,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+                let buffer = buffer.unwrap();
+                let mut at = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut at)).unwrap();
+                Spin {
+                    root,
+                    pso,
+                    _target: target,
+                    _rtvs: rtvs,
+                    rtv,
+                    buffer,
+                    words: at.cast_const().cast(),
+                    width,
+                    height,
+                }
+            }
+        }
+
+        /// Draws; how long the submission took (ms) and how many pixels
+        /// wrote `tag`.
+        fn draw(&self, host: &super::Host, n: u32, tag: u32) -> (f64, usize) {
+            let list = host.new_list().unwrap();
+            let l = &list.list;
+            // SAFETY: an open list; our pipeline, buffer and target.
+            unsafe {
+                l.SetPipelineState(&self.pso);
+                l.SetGraphicsRootSignature(&self.root);
+                l.SetGraphicsRootUnorderedAccessView(0, self.buffer.GetGPUVirtualAddress());
+                l.SetGraphicsRoot32BitConstants(1, 3, [n, tag, self.width].as_ptr().cast(), 0);
+                l.OMSetRenderTargets(1, Some(&self.rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: self.width as f32,
+                    Height: self.height as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                l.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: self.width as i32,
+                    bottom: self.height as i32,
+                }]);
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            list.close();
+            let started = std::time::Instant::now();
+            host.execute(&[&list]);
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            let pixels = (self.width * self.height) as usize;
+            // SAFETY: our mapped buffer of 2 words per pixel.
+            let ran = (0..pixels)
+                .filter(|&i| unsafe { self.words.add(2 * i).read_volatile() } == tag)
+                .count();
+            (ms, ran)
+        }
+    }
+
+    /// Under D3DMetal, macOS ends a draw whose every pixel runs long about
+    /// 50 ms in, and after some of those the queue ignores all later work
+    /// while its fence still completes (VIctory-macOS #50). The ended
+    /// submissions are seen, a new queue replaces the one that stopped, and
+    /// a draw after that runs whole. Wine on macOS only, and ignored:
+    /// elsewhere these draws would run for seconds or reset the GPU.
+    #[test]
+    #[ignore]
+    fn work_goes_on_after_macos_stops_the_queue() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (width, height) = (512, 256);
+        let pixels = (width * height) as usize;
+        let spin = Spin::new(host, width, height);
+        let mut tag = 1;
+        // Loop passes per millisecond, from a draw of 20 to 40 ms.
+        let mut n = 1024u32;
+        let per_ms = loop {
+            tag += 1;
+            let (ms, ran) = spin.draw(host, n, tag);
+            assert_eq!(ran, pixels, "a short draw runs whole");
+            if ms >= 20.0 {
+                break f64::from(n) / ms;
+            }
+            n *= 2;
+        };
+        let long = (per_ms * 4000.0).min(f64::from(u32::MAX)) as u32;
+        let [lost, queues] = [0, 1].map(|i| LOST[i].load(Ordering::Relaxed));
+        for _ in 0..8 {
+            tag += 1;
+            let (_, ran) = spin.draw(host, long, tag);
+            assert_ne!(ran, pixels, "macOS ends a draw of about 4 s");
+            if LOST[1].load(Ordering::Relaxed) > queues {
+                break;
+            }
+        }
+        assert!(
+            LOST[0].load(Ordering::Relaxed) > lost,
+            "the ended draws were seen"
+        );
+        assert!(
+            LOST[1].load(Ordering::Relaxed) > queues,
+            "a new queue replaced the one that stopped"
+        );
+        tag += 1;
+        assert_eq!(
+            spin.draw(host, 4, tag).1,
+            pixels,
+            "a draw on the new queue runs whole"
+        );
     }
 }
