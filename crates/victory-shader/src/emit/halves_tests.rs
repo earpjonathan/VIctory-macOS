@@ -126,6 +126,16 @@ fn lowered(
     native: &NativeProgram,
     host_wave32: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
+    lowered_with(native, host_wave32, false)
+}
+
+/// [`lowered`], with LDS synced for narrow host waves where `narrow_waves`
+/// (`emit::Options::narrow_waves`, D3DMetal).
+fn lowered_with(
+    native: &NativeProgram,
+    host_wave32: bool,
+    narrow_waves: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -143,6 +153,7 @@ fn lowered(
         view_marks: false,
         atomic_locks: false,
         bias_as_gradients: false,
+        narrow_waves,
         host_wave32,
     })
 }
@@ -385,10 +396,29 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
 /// as one wave64 where the adapter runs 64-lane waves. A line per lane whose
 /// dwords differ from `want` (the console's, `per_lane` per lane).
 fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
-    let n = native(words, true, threads, 0);
+    differences_with(words, threads, per_lane, want, 0, false)
+}
+
+/// [`differences`] for a program with `lds_bytes` of LDS, lowered with
+/// `narrow_waves` ([`lowered_with`]).
+fn differences_with(
+    words: &[u32],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+    lds_bytes: u32,
+    narrow_waves: bool,
+) -> Vec<String> {
+    let n = native(words, true, threads, lds_bytes);
     let forms = [
-        ("halves", shader(lowered(&n, true).expect("halves"))),
-        ("wave64", shader(lowered(&n, false).expect("one wave64"))),
+        (
+            "halves",
+            shader(lowered_with(&n, true, narrow_waves).expect("halves")),
+        ),
+        (
+            "wave64",
+            shader(lowered_with(&n, false, narrow_waves).expect("one wave64")),
+        ),
     ];
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
@@ -566,4 +596,80 @@ fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
 "
         )
     );
+}
+
+/// Each lane of a one-wave group of 64 writes its `v_mbcnt` count to LDS and
+/// reads the dword of the lane 32 away, in the other half: the console's
+/// lockstep orders the two without a barrier.
+fn lds_across_halves() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(3, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_lds_program_is_what_its_comments_say() {
+    let code: Vec<u8> = lds_across_halves()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_mbcnt_lo_u32_b32 v1, -1, 0",
+        "ds_write_b32 v2, v1",
+        "v_xor_b32 v4, 32, v0",
+        "v_lshlrev_b32 v4, 2, v4",
+        "ds_read_b32 v3, v4",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// With narrow host waves (#148, D3DMetal), a one-wave group whose LDS gets
+/// its barrier runs in halves instead of being refused; without them it is
+/// refused, as before.
+#[test]
+fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
+    let n = native(&lds_across_halves(), true, 64, 256);
+    let synced = lowered_with(&n, true, true).expect("synced, in halves");
+    assert_eq!(synced.wave_size, Some(32));
+    assert_eq!(synced.split_barriers, 1);
+    let why = lowered_with(&n, true, false)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        why.contains("LDS one console wave64 shares without barriers"),
+        "{why}"
+    );
+}
+
+/// The synced program on every hardware adapter, in halves: each lane reads
+/// the count the lane in the other half wrote (32 for the low half, the
+/// lane less 32 for the high one).
+#[test]
+fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
+    let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
+    let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

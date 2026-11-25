@@ -400,6 +400,11 @@ pub struct Options {
     /// 32, and is refused where it reads across them (`lower::halves`).
     /// The translation differs, so the shader cache keys on it.
     pub host_wave32: bool,
+    /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
+    /// says (D3DMetal): a compute group that is one console wave of more
+    /// than 32 lanes gets group barriers where its lanes read LDS other
+    /// lanes may have written, which the console's lockstep made safe.
+    pub narrow_waves: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -527,6 +532,7 @@ pub fn emit_with(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
+        narrow_waves: options.narrow_waves,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
