@@ -72,9 +72,23 @@ pub fn run(
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
     println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    // Under Rosetta, tracking is on by default from macOS 27, and the
+    // stores it cannot resume are then patched unless the variable says
+    // otherwise (`victory_gpu::fault_tracking`).
+    println!(
+        "fault tracking {}",
+        if victory_gpu::fault_tracking() {
+            "on"
+        } else {
+            "off (title memory copied whole)"
+        }
+    );
     // The file's bytes (the exe's size, 114 MB) are kept only to patch the
     // masked stores after the mapping.
-    let patching = std::env::var("VICTORY_PATCH_MASKED").ok();
+    let patching = victory_loader::masked::choice(
+        std::env::var("VICTORY_PATCH_MASKED").ok(),
+        victory_gpu::stores_need_patching(),
+    );
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;

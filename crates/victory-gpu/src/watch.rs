@@ -34,7 +34,8 @@
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen.
 //!
-//! Under Rosetta (Wine on macOS) nothing is tracked: see
+//! Under Rosetta (Wine on macOS) memory is tracked from macOS 27 on, with
+//! the stores Rosetta cannot resume rewritten at load time: see
 //! [`fault_tracking`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,23 +44,40 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 /// Whether title writes may fault into a tracker: the guards here and the
 /// write watch of the runtime's pools (`victory_hle`'s `XMemVirtualAlloc`,
-/// which Wine emulates with page protection). Not under Rosetta: it
-/// cannot resume an AVX2 masked store (`vpmaskmovd`) that faults after
-/// writing its first lanes, which happens when the store starts in
-/// writable memory and ends in a protected page; it prints `unexpectedly
-/// need to EmulateForward on a synchronous exception` and the process
-/// hangs (VIctory-macOS issue #1). Without tracking, copies take their
-/// memory whole every time, as they do for memory that is not the
-/// runtime's. `VICTORY_FAULT_TRACKING=1` turns tracking on anyway, `0`
-/// turns it off. Tests keep it on: their stores do not cross pages.
+/// which Wine emulates with page protection). Every store that hits a
+/// tracked page must be resumed after the fault. Rosetta cannot resume
+/// some: it prints `unexpectedly need to EmulateForward on a synchronous
+/// exception` and the process hangs (VIctory-macOS issue #1). On macOS 27
+/// those are AVX masked stores that start in writable memory and end in a
+/// protected page, and `vcvtps2ph` stores anywhere in one; the loader
+/// rewrites both as plain stores whenever tracking runs under Rosetta
+/// ([`stores_need_patching`]). Earlier Rosetta also stops on a plain 32-byte
+/// `vmovups` across pages (macOS 26.6, #1), so under Rosetta tracking is on
+/// by default only from Darwin 27 (macOS 27) on. Without tracking, copies
+/// take their memory whole every time, as they do for memory that is not
+/// the runtime's (tens of GB per world frame, #50). `VICTORY_FAULT_TRACKING=1`
+/// turns tracking on anyway, `0` turns it off. Tests keep it on: their
+/// stores do not cross pages.
 pub fn fault_tracking() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
         decide(
             std::env::var("VICTORY_FAULT_TRACKING").ok().as_deref(),
-            cfg!(test) || !rosetta(),
+            cfg!(test) || tracks_by_default(darwin()),
         )
     });
     *ON
+}
+
+/// Whether tracking runs under Rosetta, so the stores Rosetta cannot resume
+/// after a fault must be rewritten at load time (`victory_loader::masked`).
+pub fn stores_need_patching() -> bool {
+    fault_tracking() && darwin().is_some()
+}
+
+/// [`fault_tracking`]'s default on a host: on, except under Rosetta before
+/// Darwin 27.
+fn tracks_by_default(darwin: Option<u32>) -> bool {
+    darwin.is_none_or(|major| major >= 27)
 }
 
 /// `fault_tracking` from the variable's value and the default.
@@ -71,27 +89,43 @@ fn decide(var: Option<&str>, default: bool) -> bool {
     }
 }
 
-/// Whether x86-64 code here runs under Rosetta: Wine on macOS, whose
-/// x86-64 Wine only runs that way on the Apple silicon Macs D3DMetal needs.
-fn rosetta() -> bool {
-    use std::ffi::{CStr, c_char};
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
-    // SAFETY: ntdll is always loaded and both names end with a NUL. Wine's
-    // `wine_get_host_version` (cdecl, two out pointers) sets them to static
-    // strings: the host's `uname` system name and release.
-    unsafe {
-        let Some(f) = GetProcAddress(
-            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
-            c"wine_get_host_version".as_ptr().cast(),
-        ) else {
-            return false;
-        };
-        let f: HostVersion = std::mem::transmute(f);
-        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
-        f(&mut sysname, &mut release);
-        !sysname.is_null() && CStr::from_ptr(sysname) == c"Darwin"
-    }
+/// The host's Darwin major release when x86-64 code here runs under
+/// Rosetta: Wine on macOS, whose x86-64 Wine only runs that way on the
+/// Apple silicon Macs D3DMetal needs. None elsewhere.
+fn darwin() -> Option<u32> {
+    static DARWIN: LazyLock<Option<u32>> = LazyLock::new(|| {
+        use std::ffi::{CStr, c_char};
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
+        // SAFETY: ntdll is always loaded and both names end with a NUL.
+        // Wine's `wine_get_host_version` (cdecl, two out pointers) sets them
+        // to static strings: the host's `uname` system name and release.
+        unsafe {
+            let f = GetProcAddress(
+                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+                c"wine_get_host_version".as_ptr().cast(),
+            )?;
+            let f: HostVersion = std::mem::transmute(f);
+            let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+            f(&mut sysname, &mut release);
+            if sysname.is_null() || CStr::from_ptr(sysname) != c"Darwin" {
+                return None;
+            }
+            let release = (!release.is_null()).then(|| CStr::from_ptr(release).to_string_lossy());
+            Some(major(release.as_deref().unwrap_or("")))
+        }
+    });
+    *DARWIN
+}
+
+/// The major number of a `uname` release such as `27.0.0`; 0 when there
+/// is none.
+fn major(release: &str) -> u32 {
+    release
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -1141,6 +1175,24 @@ pub(crate) mod tests {
         assert!(!decide(Some("yes"), false));
         // Tests keep tracking on, under Rosetta too.
         assert!(fault_tracking() || std::env::var("VICTORY_FAULT_TRACKING").as_deref() == Ok("0"));
+    }
+
+    #[test]
+    fn tracking_is_on_by_default_except_under_rosetta_before_darwin_27() {
+        assert!(tracks_by_default(None));
+        assert!(!tracks_by_default(Some(0)));
+        // macOS 26.6 is Darwin 25.
+        assert!(!tracks_by_default(Some(25)));
+        assert!(!tracks_by_default(Some(26)));
+        assert!(tracks_by_default(Some(27)));
+        assert!(tracks_by_default(Some(28)));
+        let majors = ["27.0.0", "25.6.0", "27", "", "x.1"].map(major);
+        assert_eq!(majors, [27, 25, 27, 0, 0]);
+        // Stores are patched exactly when tracking runs under Rosetta.
+        assert_eq!(
+            stores_need_patching(),
+            fault_tracking() && darwin().is_some()
+        );
     }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
