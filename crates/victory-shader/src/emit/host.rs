@@ -1664,9 +1664,9 @@ impl Host {
             };
             // Zeros a UAV made as a copy destination (`size`: a texture's
             // and its format, `n` its words per texel, else a buffer's dwords)
-            // and returns
-            // the upload buffer to keep. A new committed resource is not
-            // always zeroed: WARP hands out memory a freed buffer of ours held.
+            // and returns the upload buffer to keep. A new committed resource
+            // is not always zeroed: WARP hands out memory a freed buffer of
+            // ours held.
             let zero = |r: &ID3D12Resource, size: Option<(u32, u32, DXGI_FORMAT)>, n: u32| {
                 let zeros = match size {
                     Some((w, h, format)) => {
