@@ -49,6 +49,8 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 
 After these fixes the whole suite passed under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored. After the merge of 25 November 2026 and the fixes below it gives 481 passed, 0 failed and 7 ignored.
 
+A Wine built with a macOS 27 SDK used to crash on macOS 26 at its first start, in `server_pipe`. Configure found `pipe2`, which only macOS 27 has (MarshallStunt, #50). Of the 33 functions Wine's configure checks for, it is the only one that macOS 27.0.1 exports and the macOS 26.5 SDK lacks. `build-crossover-wine.sh` now tells configure that `pipe2` is missing, and Wine falls back to `pipe` and `fcntl`. A Wine that crashes this way has to be built again: remove `target/crossover/build` and `target/wine-cx`, then run `./setup.sh`.
+
 ## Run-time HLSL and textures under Wine and D3DMetal
 
 Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26.3 Wine it differs from Microsoft's compilers in four ways that matter here:
