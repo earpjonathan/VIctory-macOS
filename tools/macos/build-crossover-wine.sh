@@ -5,9 +5,17 @@
 #
 # DEPS names an x86_64 prefix with FreeType and GnuTLS, such as the
 # build/deps folder of the Minecraft Bedrock macOS setup.
+#
+# The patches in tools/macos/patches are applied to the source. A Wine that
+# is already installed gets only its server rebuilt (see below), and
+#   tools/macos/build-crossover-wine.sh --stamp
+# prints the stamp of the patches that setup.sh compares with the install's.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
+PATCHES=("${0:A:h}"/patches/*.patch(N))
+stamp() { (( ${#PATCHES} )) && cat "${PATCHES[@]}" | shasum -a 256 | cut -c1-64 || true; }
+if [[ ${1-} == --stamp ]]; then stamp; exit 0; fi
 DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
@@ -59,6 +67,26 @@ if ! grep -q 'victory-macos fallback' "$VK"; then
   mv "$VK.new" "$VK"
 fi
 
+# An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
+# install would put Wine's back. So it gets only its server rebuilt, which
+# is enough while the patches change nothing but the server.
+installed=0
+if [[ -x $PREFIX/bin/wine ]]; then
+  installed=1
+  outside=($(grep -h '^+++ ' "${PATCHES[@]}" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | grep -v '^server/' || true))
+  (( ${#outside} == 0 )) || { echo "the patches change ${outside[*]}: remove $PREFIX and build Wine again" >&2; exit 1; }
+fi
+
+# Each patch goes in once: one that already reverses cleanly is in. A patch
+# is applied only after a dry run shows all of it applies, and one that
+# neither applies nor reverses stops the build.
+for p in $PATCHES; do
+  patch -d "$SRC" -p1 -R -f -s --dry-run < "$p" > /dev/null 2>&1 && continue
+  patch -d "$SRC" -p1 -f -s --dry-run < "$p" > /dev/null 2>&1 || { echo "${p:t} does not apply to CrossOver $VERSION" >&2; exit 1; }
+  echo "applying ${p:t}"
+  patch -d "$SRC" -p1 -f -s < "$p"
+done
+
 cd "$OBJ"
 if [[ ! -f Makefile ]]; then
   echo "configuring CrossOver Wine"
@@ -77,8 +105,15 @@ if [[ ! -f Makefile ]]; then
     --without-oss --without-udev --without-inotify --without-vulkan --without-opencl \
     --without-ffmpeg > configure.log 2>&1 || { tail -20 configure.log; exit 1; }
 fi
-echo "building CrossOver Wine"
-x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
-x86 make install > install.log 2>&1
-cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
+if (( installed )); then
+  echo "rebuilding the server of the installed CrossOver Wine"
+  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  install -m 755 server/wineserver "$PREFIX/bin/wineserver"
+else
+  echo "building CrossOver Wine"
+  x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  x86 make install > install.log 2>&1
+  cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
+fi
+stamp > "$PREFIX/.victory-patches"
 echo "installed in $PREFIX"

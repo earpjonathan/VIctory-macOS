@@ -15,6 +15,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Source patches applied to the Wine VIctory runs on (tools/macos/patches).
+    "patch",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -250,6 +252,7 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("tools/macos/patches/x.patch", b"--- a/x.c\n+++ b/x.c\n").is_empty());
     }
 
     #[test]

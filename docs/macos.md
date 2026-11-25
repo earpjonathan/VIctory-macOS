@@ -85,6 +85,14 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
+## CrossOver's wineserver is patched
+
+`tools/macos/build-crossover-wine.sh` applies the patches in `tools/macos/patches` to CrossOver's source. The one there now, `wineserver-view-tree.patch`, is UwUCammie's from fxceless/victory-fork#184 (see #155 and WineHQ bug 60868). Wine's server keeps a process's memory views in a list and walks the list on every map and unmap request. The patch also keeps them in a red-black tree by base address, so those requests take O(log n). The protocol is unchanged.
+
+On an M5 Pro with 20,000 live views, the `wine_views` benchmark from #159 took 105 to 124 µs per remap pair on CrossOver's server and 30 to 32 µs on the patched one (six rounds each). The whole Wine suite passed with the patched server: 843 passed, 0 failed, 9 ignored. #155 has the numbers from the game itself.
+
+`./setup.sh` compares a stamp of the patches with `target/wine-cx/.victory-patches`. A Wine built before a patch was added or changed gets only its server rebuilt and installed, which takes a few minutes. That is because `make install` would put Wine's own DLLs back over D3DMetal's. A patch that changes anything outside `server/` needs a new Wine: remove `target/wine-cx` and run `./setup.sh` again.
+
 ## Use D3DMetal 4.0 beta 3
 
 On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30). Since #74 asks for an empty library with a null pointer, host pipelines are kept across runs on 3.0 too: mikebuckets171 saw a library written on a first run and loaded back on the second. Use 4.0 beta 3 or newer for the game. It is not the only cause of that assert, though: later the same day us3r40456 hit `+0x1dac734` with D3DMetal 4.0 beta 3 too, on both the Series X and Series S profiles, so something else in their setup also decides it (#24).
