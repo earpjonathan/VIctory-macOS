@@ -410,12 +410,15 @@ fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Ve
         let wave32 = host.wave32().unwrap_or(false);
         for (form, shader) in &forms {
             let label = format!("{adapter} ({form})");
-            let Ok((root, pso)) = host.compute_pipeline(shader) else {
-                // Only the console's own form may be refused, and only
-                // where the host's waves are 32 lanes.
-                assert!(*form == "wave64" && wave32, "{label}: no pipeline");
-                eprintln!("{label}: no pipeline for 64-lane waves; skipped");
+            // A host of 32-lane waves only ever runs the halves. NVIDIA
+            // refuses the console's own form; D3DMetal makes its pipeline
+            // and then runs nothing.
+            if *form == "wave64" && wave32 {
+                eprintln!("{label}: one wave64 on a host of 32-lane waves; skipped");
                 continue;
+            }
+            let Ok((root, pso)) = host.compute_pipeline(shader) else {
+                panic!("{label}: no pipeline");
             };
             let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             let out = host
