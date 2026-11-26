@@ -103,10 +103,11 @@ unsafe impl Sync for Host {}
 
 /// What shows that a submission ran: a list run last in every submission,
 /// which copies the submission's number from upload memory into read-back
-/// memory. Under D3DMetal, macOS ends a command buffer whose draw holds the
-/// GPU too long (`kIOGPUCommandBufferCallbackErrorHang`: about 50 ms into a
-/// draw whose every pixel runs long), and after some of those the queue
-/// ignores everything submitted to it, presents included
+/// memory. Under D3DMetal, macOS ends a command buffer when the GPU locks up
+/// on it (`kIOGPUCommandBufferCallbackErrorHang`: about 50 ms into a draw
+/// whose every pixel runs long) or takes a page fault in it ("MMU
+/// interrupt" in the gpuEvent report, VIctory-macOS #178), and after some
+/// of those the queue ignores everything submitted to it, presents included
 /// (`kIOGPUCommandBufferCallbackErrorSubmissionsIgnored`), while its fence
 /// still completes and the device is not removed (VIctory-macOS #50). A
 /// list after the ended one in the same submission does not run either.
@@ -1478,7 +1479,8 @@ impl Host {
                 tracing::warn!(
                     lost,
                     "the host GPU ended a submission before it finished, and what it drew is missing \
-                     (under D3DMetal, macOS ends a command buffer whose draw holds the GPU too long)"
+                     (under D3DMetal, macOS ends a command buffer when the GPU locks up, as on a draw \
+                     that holds it too long, or takes a page fault)"
                 );
             }
             return;
