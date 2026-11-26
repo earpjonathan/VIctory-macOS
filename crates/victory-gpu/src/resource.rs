@@ -1578,7 +1578,7 @@ const BUDGET_LOW: f64 = 0.85;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
-const SOON_FRAMES: u64 = 10;
+pub(crate) const SOON_FRAMES: u64 = 10;
 
 /// Host textures given up, their bytes, those made again since, and those
 /// made again within [`SOON_FRAMES`].
@@ -1623,12 +1623,45 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        let budget = budget_mb(budget);
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
+}
+
+/// The card's budget in MB that [`evict_unused`] keeps host textures under:
+/// `VICTORY_GPU_BUDGET_MB` when set, else the device's (`device`). Under
+/// D3DMetal the device's is about four fifths of the Mac's memory, which the
+/// title's own memory shares, and memory freed through D3DMetal stays with
+/// the process for its next resources: on a Mac with 8 GB, unused textures
+/// filled memory into swap long before the pass would start (#135).
+#[cfg(windows)]
+fn budget_mb(device: f64) -> f64 {
+    static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        let mb = budget_setting(std::env::var("VICTORY_GPU_BUDGET_MB").ok().as_deref());
+        if let Some(mb) = mb {
+            tracing::info!(
+                mb,
+                "host textures kept under a card budget of VICTORY_GPU_BUDGET_MB"
+            );
+        }
+        mb
+    });
+    set.unwrap_or(device)
+}
+
+/// A `VICTORY_GPU_BUDGET_MB` value: a number of MB above zero, else none.
+#[cfg(windows)]
+fn budget_setting(value: Option<&str>) -> Option<f64> {
+    value?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|mb| mb.is_finite() && *mb > 0.0)
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -2510,6 +2543,19 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    /// `VICTORY_GPU_BUDGET_MB` takes a number of MB above zero; anything
+    /// else leaves the device's budget.
+    #[cfg(windows)]
+    #[test]
+    fn a_budget_setting_is_megabytes_above_zero() {
+        assert_eq!(budget_setting(Some("2500")), Some(2500.0));
+        assert_eq!(budget_setting(Some(" 3072.5 ")), Some(3072.5));
+        for bad in ["", "0", "-1", "lots", "NaN", "inf"] {
+            assert_eq!(budget_setting(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(budget_setting(None), None);
     }
 
     /// Title textures of one memory share a key in any format of the same
