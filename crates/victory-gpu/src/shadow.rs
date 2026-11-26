@@ -2708,6 +2708,9 @@ pub(crate) mod tests {
             return; // no host GPU here
         }
         let host = host().unwrap();
+        // A title range no other test uses: `widened::sync` patches every
+        // live widened view a write overlaps, other tests' views as well
+        // (tests run at the same time). Nothing is mapped this low.
         let start = 0x1000u64;
         let (parent_buffer, parent_data) = host.shared_buffer(48).unwrap();
         // SAFETY: a live buffer.
@@ -2763,7 +2766,9 @@ pub(crate) mod tests {
             return;
         }
         let host = host().unwrap();
-        let start = 0x1000u64;
+        // A title range of its own, as in
+        // `widened_views_patch_partial_elements_from_another_shadow`.
+        let start = 0x2000u64;
         let (parent_buffer, parent_data) = host.shared_buffer(12).unwrap();
         // SAFETY: a live buffer.
         let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
@@ -2819,7 +2824,9 @@ pub(crate) mod tests {
             return;
         }
         let host = host().unwrap();
-        let start = 0x1000u64;
+        // A title range of its own, as in
+        // `widened_views_patch_partial_elements_from_another_shadow`.
+        let start = 0x3000u64;
         let (parent_buffer, parent_data) = host.shared_buffer(24).unwrap();
         // SAFETY: a live buffer.
         let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
