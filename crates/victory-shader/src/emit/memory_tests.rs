@@ -190,6 +190,8 @@ fn program() -> HostShader {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
         view_marks: false,
     })
     .expect("lower");
@@ -421,6 +423,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
         view_marks: false,
     })
     .expect("lower");
@@ -565,6 +569,8 @@ fn writes_through_views_mark_their_pages() {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
         view_marks: true,
     })
     .expect("lower");
@@ -681,9 +687,11 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            host_wave32: false,
             view_marks: true,
             atomic_locks: false,
             bias_as_gradients: false,
+            narrow_waves: false,
         })
         .expect("lower")
     };

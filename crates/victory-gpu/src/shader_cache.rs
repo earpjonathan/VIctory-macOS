@@ -53,7 +53,8 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// change at run time, and whether the host's waves are 32 lanes at most,
+/// [`host_wave32`]).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,18 +65,26 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, host_wave32())
     })
+}
+
+/// Whether translations are for a host of 32-lane waves: the host GPU's
+/// (made here if it is not yet: the cache belongs to the GPU it was filled
+/// on, as the pipeline library does); none without one.
+fn host_wave32() -> bool {
+    crate::host::host().is_some_and(crate::host::Host::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[u8::from(wave32)]);
     *h.finalize().as_bytes()
 }
 
@@ -103,6 +112,18 @@ fn bias_as_gradients() -> bool {
     })
 }
 
+/// Whether translations take wave64 programs to run in 32-lane host waves:
+/// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
+/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
+fn narrow_waves() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -123,10 +144,12 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
-    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
+/// as gradients, narrow waves): their own cache entries, one per
+/// combination.
+fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
+    let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
+    BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
@@ -135,26 +158,40 @@ fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
         if bias {
             h.update(b"bias as gradients");
         }
+        if narrow {
+            h.update(b"narrow waves");
+        }
         *h.finalize().as_bytes()
     })
+}
+
+pub(crate) fn runtime_options() -> victory_shader::emit::Options {
+    // Writes through views mark their pages: copy-backs compare only those
+    // (`crate::shadow::copy_back_marks`).
+    // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
+    // leave the texels untouched (`emit`, "Atomic locks"). On a host of
+    // 32-lane waves, wave64 programs run in halves (`build` keys on it).
+    victory_shader::emit::Options {
+        view_marks: true,
+        atomic_locks: atomic_locks(),
+        bias_as_gradients: bias_as_gradients(),
+        host_wave32: host_wave32(),
+        narrow_waves: narrow_waves(),
+    }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
-    // leave the texels untouched (`emit`, "Atomic locks").
-    let options = victory_shader::emit::Options {
-        view_marks: true,
-        atomic_locks: atomic_locks(),
-        bias_as_gradients: bias_as_gradients(),
-    };
+    let options = runtime_options();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients {
-        options_build(options.atomic_locks, options.bias_as_gradients)
+    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
+        options_build(
+            options.atomic_locks,
+            options.bias_as_gradients,
+            options.narrow_waves,
+        )
     } else {
         build()
     };
@@ -503,21 +540,23 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the host's wave width) makes
+    /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                host_wave32()
             )
         );
         // The encoding part is this file as built.

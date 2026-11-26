@@ -34,7 +34,7 @@
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen.
 //!
-//! Under Rosetta (Wine on macOS) memory is tracked from macOS 27 on, with
+//! Under Rosetta (Wine on macOS) memory is tracked only when asked for, with
 //! the stores Rosetta cannot resume rewritten at load time: see
 //! [`fault_tracking`].
 
@@ -52,17 +52,17 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// protected page, and `vcvtps2ph` stores anywhere in one; the loader
 /// rewrites both as plain stores whenever tracking runs under Rosetta
 /// ([`stores_need_patching`]). Earlier Rosetta also stops on a plain 32-byte
-/// `vmovups` across pages (macOS 26.6, #1), so under Rosetta tracking is on
-/// by default only from Darwin 27 (macOS 27) on. Without tracking, copies
-/// take their memory whole every time, as they do for memory that is not
-/// the runtime's (tens of GB per world frame, #50). `VICTORY_FAULT_TRACKING=1`
-/// turns tracking on anyway, `0` turns it off. Tests keep it on: their
-/// stores do not cross pages.
+/// `vmovups` across pages (macOS 26.6, #1), and #144 hung on an M1 with
+/// both switches on, so under Rosetta tracking stays off unless
+/// `VICTORY_FAULT_TRACKING=1` asks for it. Without tracking, copies take
+/// their memory whole every time, as they do for memory that is not the
+/// runtime's (tens of GB per world frame, #50). `0` turns tracking off
+/// anywhere. Tests keep it on: their stores do not cross pages.
 pub fn fault_tracking() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
         decide(
             std::env::var("VICTORY_FAULT_TRACKING").ok().as_deref(),
-            cfg!(test) || tracks_by_default(darwin()),
+            cfg!(test) || !rosetta(),
         )
     });
     *ON
@@ -71,13 +71,7 @@ pub fn fault_tracking() -> bool {
 /// Whether tracking runs under Rosetta, so the stores Rosetta cannot resume
 /// after a fault must be rewritten at load time (`victory_loader::masked`).
 pub fn stores_need_patching() -> bool {
-    fault_tracking() && darwin().is_some()
-}
-
-/// [`fault_tracking`]'s default on a host: on, except under Rosetta before
-/// Darwin 27.
-fn tracks_by_default(darwin: Option<u32>) -> bool {
-    darwin.is_none_or(|major| major >= 27)
+    fault_tracking() && rosetta()
 }
 
 /// `fault_tracking` from the variable's value and the default.
@@ -89,43 +83,27 @@ fn decide(var: Option<&str>, default: bool) -> bool {
     }
 }
 
-/// The host's Darwin major release when x86-64 code here runs under
-/// Rosetta: Wine on macOS, whose x86-64 Wine only runs that way on the
-/// Apple silicon Macs D3DMetal needs. None elsewhere.
-fn darwin() -> Option<u32> {
-    static DARWIN: LazyLock<Option<u32>> = LazyLock::new(|| {
-        use std::ffi::{CStr, c_char};
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
-        // SAFETY: ntdll is always loaded and both names end with a NUL.
-        // Wine's `wine_get_host_version` (cdecl, two out pointers) sets them
-        // to static strings: the host's `uname` system name and release.
-        unsafe {
-            let f = GetProcAddress(
-                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
-                c"wine_get_host_version".as_ptr().cast(),
-            )?;
-            let f: HostVersion = std::mem::transmute(f);
-            let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
-            f(&mut sysname, &mut release);
-            if sysname.is_null() || CStr::from_ptr(sysname) != c"Darwin" {
-                return None;
-            }
-            let release = (!release.is_null()).then(|| CStr::from_ptr(release).to_string_lossy());
-            Some(major(release.as_deref().unwrap_or("")))
-        }
-    });
-    *DARWIN
-}
-
-/// The major number of a `uname` release such as `27.0.0`; 0 when there
-/// is none.
-fn major(release: &str) -> u32 {
-    release
-        .split('.')
-        .next()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(0)
+/// Whether x86-64 code here runs under Rosetta: Wine on macOS, whose
+/// x86-64 Wine only runs that way on the Apple silicon Macs D3DMetal needs.
+pub fn rosetta() -> bool {
+    use std::ffi::{CStr, c_char};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
+    // SAFETY: ntdll is always loaded and both names end with a NUL. Wine's
+    // `wine_get_host_version` (cdecl, two out pointers) sets them to static
+    // strings: the host's `uname` system name and release.
+    unsafe {
+        let Some(f) = GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+            c"wine_get_host_version".as_ptr().cast(),
+        ) else {
+            return false;
+        };
+        let f: HostVersion = std::mem::transmute(f);
+        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+        f(&mut sysname, &mut release);
+        !sysname.is_null() && CStr::from_ptr(sysname) == c"Darwin"
+    }
 }
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -275,18 +253,25 @@ thread_local! {
 static OPENED_UNDER_LOCK: [std::sync::atomic::AtomicUsize; 64] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
 
+/// Whether any block waits in them: the next holder of the lock scans
+/// [`OPENED_UNDER_LOCK`] only when one was opened, not on every take. Only
+/// touched while the lock is held, so a clear scan leaves no block behind.
+static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A fault on the block `page` by the thread holding the guard lock: write
 /// access back now, marked changed by the lock's next holder.
 // shortcut: assumes a read-only block this thread writes while
 // holding the lock is one of ours; with all 64 slots taken the block stays
 // open without being marked (counted); a bigger table if that shows up.
 fn open_under_lock(page: usize) {
-    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     // SAFETY: a block of this process; fails harmlessly if it is gone.
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
-    if !OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
+    if OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
+        OPENED.store(true, Release);
+    } else {
         static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         LOST.fetch_add(1, Relaxed);
     }
@@ -314,10 +299,12 @@ fn guards() -> Held {
         #[cfg(feature = "diagnostics")]
         line: std::panic::Location::caller().line(),
     };
-    for slot in &OPENED_UNDER_LOCK {
-        let page = slot.swap(0, AcqRel);
-        if page != 0 {
-            changed(&mut held, page, page + 1, false);
+    if OPENED.swap(false, AcqRel) {
+        for slot in &OPENED_UNDER_LOCK {
+            let page = slot.swap(0, AcqRel);
+            if page != 0 {
+                changed(&mut held, page, page + 1, false);
+            }
         }
     }
     held
@@ -1178,21 +1165,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tracking_is_on_by_default_except_under_rosetta_before_darwin_27() {
-        assert!(tracks_by_default(None));
-        assert!(!tracks_by_default(Some(0)));
-        // macOS 26.6 is Darwin 25.
-        assert!(!tracks_by_default(Some(25)));
-        assert!(!tracks_by_default(Some(26)));
-        assert!(tracks_by_default(Some(27)));
-        assert!(tracks_by_default(Some(28)));
-        let majors = ["27.0.0", "25.6.0", "27", "", "x.1"].map(major);
-        assert_eq!(majors, [27, 25, 27, 0, 0]);
+    fn tracking_is_opt_in_under_rosetta() {
+        // The variable decides when it is set; otherwise tracking is on
+        // except under Rosetta (`fault_tracking`'s default is `!rosetta()`).
+        assert!(decide(Some("1"), false));
+        assert!(!decide(Some("0"), true));
+        assert!(decide(None, true));
+        assert!(!decide(None, false));
+        assert!(!decide(Some("2"), false));
         // Stores are patched exactly when tracking runs under Rosetta.
-        assert_eq!(
-            stores_need_patching(),
-            fault_tracking() && darwin().is_some()
-        );
+        assert_eq!(stores_need_patching(), fault_tracking() && rosetta());
     }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),

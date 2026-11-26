@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -26,6 +27,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Per title slot, its record once the slot is made from it and holds
+    /// what a draw reads (a texture's view not left null), else 0: what
+    /// [`HostHeap::mirror`] finds without the `made` lock, which every
+    /// title thread binding or writing views would otherwise wait on. Set
+    /// last, under that lock, once the slot is made; cleared first.
+    ready: Box<[AtomicU64]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -42,6 +49,8 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
+    /// Null raw SRV for explicitly bound root descriptors. Its UAV is one slot below.
+    null_root_srv: Option<u32>,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -199,7 +208,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let h = HostHeap {
+        let mut h = HostHeap {
             heap,
             cpu,
             step,
@@ -207,9 +216,11 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
+            null_root_srv: None,
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
@@ -234,14 +245,27 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
-            h.raw_view_at(null, None, 0, 0, false);
-            h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+        if !sampler {
+            let fixed = victory_shader::emit::NULL_BUFFER_VIEW;
+            let null = if fixed > count + extra && fixed < total {
+                Some(fixed)
+            } else {
+                tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+                // Root descriptors receive a heap index at bind time and can
+                // use a pair inside a capped heap. Keep it for the heap's life.
+                h.pair().map(|first| first + 1)
+            };
+            if let Some(srv) = null {
+                h.raw_view_at(srv, None, 0, 0, false);
+                h.raw_view_at(srv - 1, None, 0, 0, true);
+                h.null_root_srv = Some(srv);
+            }
         }
         Some(h)
+    }
+
+    pub(crate) fn null_root_view(&self, uav: bool) -> Option<u32> {
+        self.null_root_srv.map(|srv| srv - u32::from(uav))
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -699,12 +723,25 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Made from this record already and readable as it is (what the
+        // checks below find under the lock): nothing to make.
+        if tag == VIEW_TAG
+            && self.ready[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // A second recorder may have replaced the slot while this thread waited.
+        // SAFETY: the caller holds the heap alive until the update completes.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
@@ -748,6 +785,7 @@ impl HostHeap {
             }
         }
         {
+            self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
@@ -767,7 +805,11 @@ impl HostHeap {
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            // A texture's view left null is made again when a draw reads it.
+            let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
+            self.keep(index, kept);
+            self.ready[index as usize].store(ready, Ordering::Release);
         }
         Some(view)
     }
@@ -793,27 +835,38 @@ impl HostHeap {
         Some(text)
     }
 
-    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// Title slots viewing one of the host textures `textures` (raw pointers),
     /// which are given up: each gets a null view of its kind and holds the
     /// texture no more (retired until the running submission has run), its
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
-    /// mark, cleared) makes it again.
+    /// mark, cleared) makes it again. Slots past `count` stay made: recorded
+    /// lists and host copies already name them, and there is no title record
+    /// from which to make them again.
     /// The slots are found by a walk of the heap, once per pass that gives
     /// textures up: a map of each texture's slots, kept at every slot the
     /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        // Keep a title slot from being rebound between testing its held texture
+        // and clearing the descriptor. Mirroring takes made before kept as well.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             kept.iter()
-                .filter(|(_, k)| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                .filter(|&(i, k)| {
+                    i < self.count as usize
+                        && k.1.is_none()
+                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                })
                 .map(|(i, _)| i as u32)
                 .collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
+            if let Some(ready) = self.ready.get(index as usize) {
+                ready.store(0, Ordering::Relaxed);
+            }
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
@@ -1455,6 +1508,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Shaders indexing the heap write through this view without
+            // moving the texture to a write state, and a slot left null is
+            // made again only when read: kept from now on.
+            copy.note_state(0x8);
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.

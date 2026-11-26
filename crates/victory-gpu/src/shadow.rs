@@ -17,7 +17,8 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -596,7 +597,12 @@ impl Shadow {
     /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
     fn update_busy(&self, from: usize, to: usize) -> usize {
         let runs = match &self.tracked {
-            Some(t) => t.take(from, to),
+            Some(t) => {
+                let mut runs = t.take(from, to);
+                runs.extend(t.untracked(from, to));
+                runs.sort_unstable();
+                runs
+            }
             None => vec![(from, to)],
         };
         if runs.is_empty() {
@@ -971,10 +977,15 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Read by every draw's views (`find`) on the title's threads, at once.
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
@@ -990,12 +1001,19 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -1008,17 +1026,43 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// The innermost entry holding `[address, end)`: the one starting closest
+/// below `address` that reaches `end`, among those starting at most `span`
+/// (the longest entry's length) below `end`. Big buffers hold many smaller
+/// ones (a heap's placed buffers), so the one holding an address past
+/// those can be any number of entries back.
+///
+/// The cost is the entries starting within `span` below `end`, which a
+/// single very long buffer makes many: the lookup walks back until one
+/// reaches `end`, where the old search stopped after 64 entries. It runs
+/// under the buffers' lock on every lookup.
+fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_read();
+        let Some(key) = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end) else {
+            drop(map);
+            return loose(address, end);
+        };
+        if let Some(shadow) = map.get(&key).and_then(|entry| entry.shadow.clone()) {
+            return Some(shadow);
+        }
+    }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
@@ -1053,20 +1097,59 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+/// gets copies of the aligned windows it touches. Smaller windows retain
+/// fewer unused bytes and require more host buffers and page-table entries.
+fn loose_window_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if crate::switch::on("VICTORY_SMALL_LOOSE_WINDOWS") {
+            256 << 10
+        } else {
+            4 << 20
+        }
+    })
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The longest window in `LOOSE`. Changed under its lock.
+static LOOSE_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// Below this nothing is ever mapped (the null page and its guard area).
+const LOWEST_MAPPED: u64 = 0x10000;
+
+/// The window copy holding `[address, end)` among `windows` (by start and
+/// length, none longer than `span`), the innermost if several do.
+fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u64, end: u64) -> Option<&V> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    windows
+        .range((lowest, 0)..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
+        .map(|(_, v)| v)
+}
+
+/// The window copy for `[address, end)` outside buffers: one already made
+/// that holds it (a range spanning two windows has one of its own, which
+/// later ranges in it share), else a new one. None for memory that is not
+/// committed (a stale or null address): 4 MiB of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    if address < LOWEST_MAPPED {
+        return None;
+    }
+    let window = loose_window_bytes();
+    let start = address & !(window - 1);
+    let len = end.checked_next_multiple_of(window)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
+    }
+    if !crate::texture::committed(address as *const u8, 1) {
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -1078,6 +1161,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1266,7 +1350,8 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> =
+        buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1274,7 +1359,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -1458,6 +1543,93 @@ pub(crate) mod tests {
         // page table still holds must not name memory reused meanwhile.
     }
 
+    /// A busy range over a tracked pool page and the plain allocation after
+    /// it still takes the title's changes on the plain page. The refresh is
+    /// asked for both one changed dword and a view wider than the copy.
+    #[test]
+    fn untracked_title_writes_under_a_mixed_busy_range_are_copied() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // A pool page and a plain one right after it, in two pages found free
+        // (other tests allocate meanwhile: tried again if taken).
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations where it was, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(
+                            q as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return; // no host GPU here
+        };
+        let tracked = copy.tracked.as_ref().expect("the pool page is tracked");
+        assert_eq!(tracked.untracked(pool, pool + len), [(plain, plain + PAGE)]);
+        assert!(!copy.clean(), "the plain page is always refreshed");
+        let word = (plain + 64) as *mut u32;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { word.write_volatile(0x1234_5678) };
+        assert_eq!(
+            copy.update(pool, len),
+            len,
+            "the initial contents reach the copy"
+        );
+        assert_eq!(copy.read_host(word as u64, 1), [0x1234_5678]);
+        // An earlier list declares the whole mixed range as written by shaders.
+        copy.writing(pool, len, false);
+        // SAFETY: a dword of our plain allocation.
+        unsafe { word.write_volatile(0x90ab_cdef) };
+        assert_eq!(copy.update(word as usize, 4), 4, "the busy dword is copied");
+        assert_eq!(
+            copy.read_host(word as u64, 1),
+            [0x90ab_cdef],
+            "the title's dword reaches the copy"
+        );
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0xfedc_ba09) };
+        assert_eq!(
+            copy.update(pool - 16, len + 32),
+            PAGE,
+            "a widened busy view takes the plain page"
+        );
+        assert_eq!(
+            copy.read_host(word as u64, 1),
+            [0xfedc_ba09],
+            "the later dword reaches the copy too"
+        );
+        assert_eq!(
+            copy.copy_back(pool, len),
+            0,
+            "the refreshed copy holds no shader write"
+        );
+        unregister(pool, pool as u64);
+        // The pages stay allocated (as the other tests' pools): a copy some
+        // page table still holds must not name memory reused meanwhile.
+    }
+
     /// Runs of the shared buffers start a whole number of elements (and of
     /// 256 bytes) in, do not overlap, and join again when given back.
     #[test]
@@ -1550,7 +1722,10 @@ pub(crate) mod tests {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1.
+        // The shaders marked pages 0 and 1. The bitmap is shared: held as a
+        // submission holds it, or another test's copy-back (or submission)
+        // can take these bits and put the pages back after the reads below.
+        let quiet = host().and_then(|h| h.quiet());
         let bits = b.data as *mut u32;
         for n in [base, base + 1] {
             // SAFETY: a dword of the mapped bitmap.
@@ -1565,6 +1740,7 @@ pub(crate) mod tests {
         // SAFETY: dwords of the mapped bitmap.
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
+        drop(quiet);
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
@@ -1587,6 +1763,8 @@ pub(crate) mod tests {
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         // Page 0 marked by another shader, page 1 by one using title memory.
+        // Held as a submission holds the bitmaps (as in the test above).
+        let quiet = host().and_then(|h| h.quiet());
         for (b, n) in [(others, base), (memory, base + 1)] {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
@@ -1597,6 +1775,7 @@ pub(crate) mod tests {
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        drop(quiet);
         unregister(p, p as u64);
     }
 
@@ -1657,5 +1836,167 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn entry(start: u64, len: u64) -> Entry {
+        Entry {
+            end: start + len,
+            shadow: None,
+        }
+    }
+
+    /// A 256 MiB parent with `children` 64 KiB buffers placed in its first
+    /// part, as a heap's placed buffers.
+    fn heap(base: u64, children: u64) -> BTreeMap<(u64, usize), Entry> {
+        let mut map = BTreeMap::new();
+        map.insert((base, 1), entry(base, 256 * MIB));
+        for i in 0..children {
+            map.insert((base + i * 0x10000, 100 + i as usize), entry(base + i * 0x10000, 0x10000));
+        }
+        map
+    }
+
+    #[test]
+    fn a_parent_is_found_past_many_children() {
+        let base = 0x10_0000_0000;
+        let map = heap(base, 200);
+        let span = 256 * MIB;
+        // Past all 200 children (and the 64 entries looked at before).
+        let at = base + 200 * 0x10000 + 0x100;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        let first_64 = map.range(..=(at, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= at + 16);
+        assert!(first_64.is_none(), "the parent is more than 64 entries back");
+        // Near the parent's end.
+        let at = base + 256 * MIB - 16;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Inside a child: the child, the innermost.
+        let at = base + 150 * 0x10000 + 8;
+        assert_eq!(enclosing(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
+        // Across two children: only the parent holds it.
+        let at = base + 151 * 0x10000 - 8;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Past the parent, and before it.
+        let at = base + 256 * MIB;
+        assert_eq!(enclosing(&map, span, at, at + 1), None);
+        assert_eq!(enclosing(&map, span, base - 16, base + 16), None);
+        // Longer than any buffer: none, without looking.
+        assert_eq!(enclosing(&map, span, base, base + span + 1), None);
+        assert_eq!(enclosing(&map, 0, base, base + 1), None);
+    }
+
+    #[test]
+    fn registered_buffers_widen_the_search() {
+        // High above anything a test maps; resource numbers no live
+        // resource has.
+        let base = 0x7f00_0000_0000;
+        let len = 512 * MIB;
+        register(1, base, len);
+        for i in 0..100u64 {
+            register(2 + i as usize, base + i * 0x1000, 0x1000);
+        }
+        assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
+        let at = base + len - 64;
+        let found = enclosing(&buffers(), MAX_SPAN.load(Ordering::Relaxed), at, at + 64);
+        for i in 0..100u64 {
+            unregister(2 + i as usize, base + i * 0x1000);
+        }
+        unregister(1, base);
+        assert_eq!(found, Some((base, 1)));
+        assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+    }
+
+    #[test]
+    fn loose_windows_are_reused_for_ranges_inside_them() {
+        let w = loose_window_bytes();
+        let base = 0x20_0000_0000;
+        let mut windows = BTreeMap::new();
+        windows.insert((base, w), "first");
+        // A range across the next two windows got one of its own.
+        windows.insert((base + w, 2 * w), "spanning");
+        let span = 2 * w;
+        let find = |address: u64, len: u64| enclosing_window(&windows, span, address, address + len).copied();
+        assert_eq!(find(base, 1), Some("first"));
+        assert_eq!(find(base + w - 16, 16), Some("first"));
+        // Inside the spanning window, also in its second half.
+        assert_eq!(find(base + w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 2 * w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 3 * w - 8, 8), Some("spanning"));
+        // Across the first window's end: none holds it whole.
+        assert_eq!(find(base + w - 8, 16), None);
+        // Past every window, before them, longer than any.
+        assert_eq!(find(base + 3 * w, 1), None);
+        assert_eq!(find(base - 8, 4), None);
+        assert_eq!(find(base, 3 * w), None);
+    }
+
+    /// A range in one window, then a range across that window's end, which
+    /// gets a window of its own over both (the first inside it): what the
+    /// title writes reaches both copies, and what the GPU writes through
+    /// the spanning one goes back to title memory and from there into the
+    /// first at its next refresh. (Within one submission the two copies are
+    /// apart, as any two copies of the same bytes are.)
+    #[test]
+    fn overlapping_windows_agree_through_title_memory() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(h) = host() else {
+            return;
+        };
+        // Held as a submission holds it (as in the mark tests above): writing
+        // and copy_back share the bitmaps and the snapshots with every other
+        // test's submission, which would otherwise interleave with them.
+        let _quiet = h.quiet();
+        let w = loose_window_bytes() as usize;
+        // SAFETY: a fresh allocation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let b = p.next_multiple_of(w);
+        let title = |at: usize| (b + at) as *mut u8;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(w - 40).write_volatile(0x11) };
+        let first = loose((b + w - 64) as u64, (b + w - 32) as u64).expect("a window");
+        let spanning = loose((b + w - 16) as u64, (b + w + 16) as u64).expect("a window across the boundary");
+        assert!(!Arc::ptr_eq(&first, &spanning));
+        assert_eq!((first.start, first.len), (b as u64, w as u64));
+        assert_eq!((spanning.start, spanning.len), (b as u64, 2 * w as u64), "the first lies inside it");
+        let byte = |s: &Shadow, at: usize| s.read_host(((b + at) & !3) as u64, 1)[0].to_le_bytes()[(b + at) % 4];
+        // The title writes: both copies take it at their refresh.
+        // SAFETY: a byte of our allocation.
+        unsafe { title(w - 40).write_volatile(0x22) };
+        first.update(b + w - 64, 64);
+        spanning.update(b + w - 64, 64);
+        assert_eq!((byte(&first, w - 40), byte(&spanning, w - 40)), (0x22, 0x22));
+        // A shader writes through the spanning copy; it goes back to title
+        // memory, and the first copy takes it at its next refresh.
+        spanning.writing(b + w - 64, 64, false);
+        spanning.write_host((b + w - 40) as u64, &[0x33]);
+        spanning.copy_back(b + w - 64, 64);
+        // SAFETY: a byte of our allocation.
+        let back = unsafe { title(w - 40).read_volatile() };
+        assert_eq!(back, 0x33, "back in title memory");
+        first.update(b + w - 64, 64);
+        assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn loose_memory_must_be_committed() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // The null page and its guard area.
+        assert!(loose(0, 16).is_none());
+        assert!(loose(0x1000, 0x1010).is_none());
+        assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
+        // Reserved, not committed.
+        // SAFETY: a fresh reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), loose_window_bytes() as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(p, 0);
+        assert!(loose(p + 64, p + 128).is_none());
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Too close to the top to round up to a window.
+        assert!(loose(u64::MAX - 8, u64::MAX).is_none());
     }
 }
