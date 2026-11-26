@@ -132,17 +132,37 @@ impl Shader {
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader translated"
+                        );
+                        // D3DMetal makes such a pipeline and marks it a no-op:
+                        // its draws are dropped without an error (#132).
+                        use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
+                        if let Some(o) = mesh_outputs(&t.host.dxil)
+                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
+                            .filter(|_| crate::shader_cache::under_wine())
+                        {
+                            tracing::warn!(
+                                hash = %self.hash,
+                                bytes = o.bytes(),
+                                limit = METAL_MESH_OUTPUT_BYTES,
+                                vertices = o.vertices,
+                                primitives = o.primitives,
+                                vertex_components = o.vertex_components,
+                                primitive_components = o.primitive_components,
+                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

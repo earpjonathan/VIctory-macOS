@@ -107,8 +107,19 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Our heap blocks of [`BIG`] bytes or more made, freed and resized
+    /// (blocks, bytes and nanoseconds in the system allocator).
+    BigMade,
+    BigMadeBytes,
+    BigMadeNs,
+    BigFreed,
+    BigFreedBytes,
+    BigFreedNs,
+    BigResized,
+    BigResizedBytes,
+    BigResizedNs,
 }
-const COUNTERS: usize = 62;
+const COUNTERS: usize = C::BigResizedNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -315,6 +326,20 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  heap blocks of {} KiB or more per frame: {:.0} made ({:.1} MB) in {:.2} ms, {:.0} freed ({:.1} MB) \
+         in {:.2} ms, {:.0} resized ({:.1} MB) in {:.2} ms",
+        BIG >> 10,
+        c[C::BigMade as usize],
+        mb(c[C::BigMadeBytes as usize]),
+        c[C::BigMadeNs as usize] / 1e6,
+        c[C::BigFreed as usize],
+        mb(c[C::BigFreedBytes as usize]),
+        c[C::BigFreedNs as usize] / 1e6,
+        c[C::BigResized as usize],
+        mb(c[C::BigResizedBytes as usize]),
+        c[C::BigResizedNs as usize] / 1e6,
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
@@ -354,6 +379,21 @@ pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
 /// power-of-two size class (who holds the big blocks of our heap).
 const LARGE: usize = 32 << 20;
 
+/// Blocks this large get virtual memory of their own from Wine's heap
+/// (smaller ones come from its pages), so making or freeing one takes
+/// Wine's one lock on the process's memory, which every thread's page
+/// faults and protection changes wait for. Freeing a written block holds
+/// it about 10 us per MB under Rosetta.
+const BIG: usize = 1020 << 10;
+
+/// Counts a call on a big block that took from `started` until now.
+fn big(counters: [C; 3], bytes: usize, started: std::time::Instant) {
+    let [n, b, ns] = counters;
+    add(n, 1);
+    add(b, bytes as u64);
+    add(ns, started.elapsed().as_nanos() as u64);
+}
+
 /// Logs the stack of a large allocation of `size` bytes, the first of its
 /// size class.
 fn note_large(size: usize) {
@@ -380,9 +420,17 @@ fn note_large(size: usize) {
 // SAFETY: every call goes to the system allocator unchanged; only counted.
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let started = (layout.size() >= BIG).then(std::time::Instant::now);
         // SAFETY: the caller's layout, passed on.
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
+            if let Some(started) = started {
+                big(
+                    [C::BigMade, C::BigMadeBytes, C::BigMadeNs],
+                    layout.size(),
+                    started,
+                );
+            }
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
             if layout.size() >= LARGE {
                 note_large(layout.size());
@@ -392,9 +440,17 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let started = (layout.size() >= BIG).then(std::time::Instant::now);
         // SAFETY: as above.
         let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !p.is_null() {
+            if let Some(started) = started {
+                big(
+                    [C::BigMade, C::BigMadeBytes, C::BigMadeNs],
+                    layout.size(),
+                    started,
+                );
+            }
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
             if layout.size() >= LARGE {
                 note_large(layout.size());
@@ -405,14 +461,30 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
 
     unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
         HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+        let started = (layout.size() >= BIG).then(std::time::Instant::now);
         // SAFETY: a block this allocator handed out with this layout.
         unsafe { std::alloc::System.dealloc(p, layout) }
+        if let Some(started) = started {
+            big(
+                [C::BigFreed, C::BigFreedBytes, C::BigFreedNs],
+                layout.size(),
+                started,
+            );
+        }
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let started = (layout.size().max(size) >= BIG).then(std::time::Instant::now);
         // SAFETY: as above.
         let q = unsafe { std::alloc::System.realloc(p, layout, size) };
         if !q.is_null() {
+            if let Some(started) = started {
+                big(
+                    [C::BigResized, C::BigResizedBytes, C::BigResizedNs],
+                    size,
+                    started,
+                );
+            }
             HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
             HEAP_BYTES.fetch_add(size as u64, Relaxed);
             if size >= LARGE {
@@ -420,5 +492,47 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
             }
         }
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BIG, C, COUNT, CountingAlloc, Relaxed};
+    use std::alloc::{GlobalAlloc, Layout};
+
+    /// Blocks, bytes made, freed and resized ([`BIG`] blocks only).
+    fn big_counts() -> [u64; 6] {
+        [
+            C::BigMade,
+            C::BigMadeBytes,
+            C::BigFreed,
+            C::BigFreedBytes,
+            C::BigResized,
+            C::BigResizedBytes,
+        ]
+        .map(|c| COUNT[c as usize].load(Relaxed))
+    }
+
+    /// A block Wine's heap maps on its own is counted when made, resized
+    /// and freed; a smaller one is not.
+    #[test]
+    fn only_blocks_of_their_own_mapping_are_counted() {
+        let layout = |size: usize| Layout::from_size_align(size, 16).unwrap();
+        let before = big_counts();
+        // SAFETY: each block is freed with the layout it was made with.
+        unsafe {
+            let small = CountingAlloc.alloc(layout(BIG - 4096));
+            assert!(!small.is_null());
+            CountingAlloc.dealloc(small, layout(BIG - 4096));
+            let p = CountingAlloc.alloc(layout(BIG));
+            assert!(!p.is_null());
+            let q = CountingAlloc.realloc(p, layout(BIG), 2 * BIG);
+            assert!(!q.is_null());
+            CountingAlloc.dealloc(q, layout(2 * BIG));
+        }
+        let after = big_counts();
+        let grew: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        let big = BIG as u64;
+        assert_eq!(grew, [1, big, 1, 2 * big, 1, 2 * big]);
     }
 }
