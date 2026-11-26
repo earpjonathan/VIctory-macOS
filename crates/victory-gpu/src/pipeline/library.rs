@@ -1717,7 +1717,7 @@ mod tests {
         };
         let name = |i: usize| format!("test: a stale pipeline {i}");
         // A library holding `held` under every name, as opened in a run.
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, Blob::default()).expect("an empty library");
         // SAFETY: the description points at live data.
         let pso: ID3D12PipelineState =
             unsafe { device.CreateComputePipelineState(&desc(&held)) }.unwrap();
@@ -1725,7 +1725,7 @@ mod tests {
             // SAFETY: a live pipeline.
             unsafe { first.library.StorePipeline(&HSTRING::from(name(i)), &pso) }.unwrap();
         }
-        let opened = open(&device, serialized(&first.library)).expect("the library again");
+        let opened = open(&device, Blob::Held(serialized(&first.library))).expect("the library again");
         let shared = Shared::new(device.clone(), opened);
         let get = |i: usize, code: &[u8], made: bool| {
             let desc = desc(code);
@@ -1763,7 +1763,7 @@ mod tests {
             assert_eq!(l.added, 5);
             serialized(&l.library)
         };
-        let saved = open(&device, bytes).expect("the new library");
+        let saved = open(&device, Blob::Held(bytes)).expect("the new library");
         let loads = |i: usize, code: &[u8]| {
             let (name, desc) = (HSTRING::from(name(i)), desc(code));
             // SAFETY: the description points at live data.
