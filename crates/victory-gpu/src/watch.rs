@@ -2044,10 +2044,8 @@ pub(crate) mod tests {
         );
         assert!(writable(page), "a take while it goes guards nothing");
         // SAFETY: the second page of our pool; the reservation stays.
-        assert_ne!(
-            unsafe { VirtualFree(page as *mut _, PAGE, MEM_DECOMMIT) },
-            0
-        );
+        let freed = unsafe { VirtualFree(page as *mut _, PAGE, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
         drop(going);
         // SAFETY: the same page of our reservation, committed again.
         let back =
