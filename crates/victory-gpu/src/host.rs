@@ -501,7 +501,7 @@ pub(crate) mod tests {
             CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("VIctory display test"),
                 WS_OVERLAPPEDWINDOW, 0, 0, 320, 180, None, None, None, None)
         }.unwrap();
-        let presenter = host.presenter_for_window(hwnd, 320, 180, format).unwrap();
+        let presenter = host.presenter_for_window(&host.queue(), hwnd, 320, 180, format).unwrap();
         host.presenter.lock().unwrap().presenter = Some(presenter);
         let state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
         let picture = crate::composite::result_texture(&host.device, 1920, 1080, format).unwrap();
@@ -3751,11 +3751,12 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height).map_err(|e| ("window", e))?,
         };
-        self.presenter_for_window(hwnd, width, height, format)
+        self.presenter_for_window(queue, hwnd, width, height, format)
     }
 
     fn presenter_for_window(
         &self,
+        queue: &ID3D12CommandQueue,
         hwnd: HWND,
         width: u32,
         height: u32,
