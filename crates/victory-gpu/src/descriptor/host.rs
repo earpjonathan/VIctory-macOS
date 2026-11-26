@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -26,6 +27,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Per title slot, its record once the slot is made from it and holds
+    /// what a draw reads (a texture's view not left null), else 0: what
+    /// [`HostHeap::mirror`] finds without the `made` lock, which every
+    /// title thread binding or writing views would otherwise wait on. Set
+    /// last, under that lock, once the slot is made; cleared first.
+    ready: Box<[AtomicU64]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -42,6 +49,8 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
+    /// Null raw SRV for explicitly bound root descriptors. Its UAV is one slot below.
+    null_root_srv: Option<u32>,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -199,7 +208,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let h = HostHeap {
+        let mut h = HostHeap {
             heap,
             cpu,
             step,
@@ -207,9 +216,11 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
+            null_root_srv: None,
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
@@ -234,14 +245,27 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
-            h.raw_view_at(null, None, 0, 0, false);
-            h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+        if !sampler {
+            let fixed = victory_shader::emit::NULL_BUFFER_VIEW;
+            let null = if fixed > count + extra && fixed < total {
+                Some(fixed)
+            } else {
+                tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+                // Root descriptors receive a heap index at bind time and can
+                // use a pair inside a capped heap. Keep it for the heap's life.
+                h.pair().map(|first| first + 1)
+            };
+            if let Some(srv) = null {
+                h.raw_view_at(srv, None, 0, 0, false);
+                h.raw_view_at(srv - 1, None, 0, 0, true);
+                h.null_root_srv = Some(srv);
+            }
         }
         Some(h)
+    }
+
+    pub(crate) fn null_root_view(&self, uav: bool) -> Option<u32> {
+        self.null_root_srv.map(|srv| srv - u32::from(uav))
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -699,12 +723,25 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Made from this record already and readable as it is (what the
+        // checks below find under the lock): nothing to make.
+        if tag == VIEW_TAG
+            && self.ready[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // A second recorder may have replaced the slot while this thread waited.
+        // SAFETY: the caller holds the heap alive until the update completes.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
@@ -748,6 +785,7 @@ impl HostHeap {
             }
         }
         {
+            self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
@@ -767,7 +805,11 @@ impl HostHeap {
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            // A texture's view left null is made again when a draw reads it.
+            let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
+            self.keep(index, kept);
+            self.ready[index as usize].store(ready, Ordering::Release);
         }
         Some(view)
     }
@@ -793,27 +835,38 @@ impl HostHeap {
         Some(text)
     }
 
-    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// Title slots viewing one of the host textures `textures` (raw pointers),
     /// which are given up: each gets a null view of its kind and holds the
     /// texture no more (retired until the running submission has run), its
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
-    /// mark, cleared) makes it again.
+    /// mark, cleared) makes it again. Slots past `count` stay made: recorded
+    /// lists and host copies already name them, and there is no title record
+    /// from which to make them again.
     /// The slots are found by a walk of the heap, once per pass that gives
     /// textures up: a map of each texture's slots, kept at every slot the
     /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        // Keep a title slot from being rebound between testing its held texture
+        // and clearing the descriptor. Mirroring takes made before kept as well.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             kept.iter()
-                .filter(|(_, k)| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                .filter(|&(i, k)| {
+                    i < self.count as usize
+                        && k.1.is_none()
+                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                })
                 .map(|(i, _)| i as u32)
                 .collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
+            if let Some(ready) = self.ready.get(index as usize) {
+                ready.store(0, Ordering::Relaxed);
+            }
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
@@ -977,6 +1030,26 @@ fn view_kind(view: &View) -> u32 {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,
+    }
+}
+
+/// The four-channel host format for a three-channel 32-bit typed SRV.
+fn widened_format(format: i32) -> Option<DXGI_FORMAT> {
+    match format {
+        6 => Some(DXGI_FORMAT_R32G32B32A32_FLOAT),
+        7 => Some(DXGI_FORMAT_R32G32B32A32_UINT),
+        8 => Some(DXGI_FORMAT_R32G32B32A32_SINT),
+        _ => None,
+    }
+}
+
+/// The fourth component's bits for a widened three-channel SRV. Integer
+/// formats must not receive the bit pattern of floating-point 1.0.
+fn widened_w(format: i32) -> Option<u32> {
+    match format {
+        6 => Some(1.0f32.to_bits()),
+        7 | 8 => Some(1),
+        _ => None,
     }
 }
 
@@ -1145,10 +1218,19 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, and the view's own copy
 /// of title memory ([`crate::shadow::for_view`]): the slot holds it, so that
 /// draws reading the view find and refresh that copy.
-type Held = (
-    ID3D12Resource,
-    Option<std::sync::Arc<crate::shadow::Shadow>>,
-);
+type Held = (ID3D12Resource, Option<HeldSource>);
+
+/// The fields keep the normal and widened copies alive for as long as the
+/// slot shows them.
+#[allow(dead_code)]
+enum HeldSource {
+    Shadow(std::sync::Arc<crate::shadow::Shadow>),
+    /// A widened three-channel view and the normal shadow it reads.
+    Widened(
+        std::sync::Arc<crate::shadow::Widened>,
+        std::sync::Arc<crate::shadow::Shadow>,
+    ),
+}
 
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
@@ -1192,12 +1274,33 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
+    if crate::shader_cache::under_wine()
+        && matches!(desc.Format.0, 6..=8)
+        && let Some(w) = widened_w(desc.Format.0)
+        && let Some(widened) = shadow.widened(start, u64::from(count) * 12, w)
+    {
+        desc.Format = widened_format(desc.Format.0).expect("a three-channel format");
+        buffer.FirstElement = 0;
+        buffer.NumElements = count;
+        // SAFETY: a live widened buffer and a slot of our heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&widened.buffer, Some(&desc), at)
+        };
+        return Some(Some((
+            widened.buffer.clone(),
+            Some(HeldSource::Widened(widened, shadow.clone())),
+        )));
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then(|| HeldSource::Shadow(shadow)),
+    )))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1262,7 +1365,10 @@ fn buffer_uav(
         )
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then(|| HeldSource::Shadow(shadow)),
+    )))
 }
 
 thread_local! {
@@ -1455,6 +1561,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Shaders indexing the heap write through this view without
+            // moving the texture to a write state, and a slot left null is
+            // made again only when read: kept from now on.
+            copy.note_state(0x8);
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
@@ -1759,6 +1869,153 @@ mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+        assert_eq!(widened_format(6), Some(DXGI_FORMAT_R32G32B32A32_FLOAT));
+        assert_eq!(widened_format(7), Some(DXGI_FORMAT_R32G32B32A32_UINT));
+        assert_eq!(widened_format(8), Some(DXGI_FORMAT_R32G32B32A32_SINT));
+        assert_eq!(widened_format(2), None);
+        assert_eq!(widened_w(6), Some(0x3f80_0000));
+        assert_eq!(widened_w(7), Some(1));
+        assert_eq!(widened_w(8), Some(1));
+        assert_eq!(widened_w(2), None);
+    }
+
+    /// Three-channel 32-bit SRVs are backed by a widened copy on hosts that
+    /// read R32G32B32 as R32G32. The copy keeps 12-byte source elements,
+    /// supplies w in the source format and follows later title writes.
+    #[test]
+    fn three_channel_srvs_use_a_widened_refreshed_copy() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        let len = 4 * 12;
+        let first: [u32; 12] = [
+            1000, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009,
+        ];
+        // SAFETY: 48 bytes of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(first.as_ptr().cast::<u8>(), p as *mut u8, len) };
+        crate::shadow::register(p, p as u64, len as u64);
+        let shadow = crate::shadow::find(p as u64, len as u64).expect("a host copy");
+        shadow.update(p, len);
+
+        // SAFETY: plain descriptor-heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 4,
+                ..Default::default()
+            })
+        }
+        .expect("a descriptor heap");
+        // SAFETY: a live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 4,
+                    ..Default::default()
+                },
+            },
+        };
+        let (resource, source) = buffer_srv(p as u64, len as u64, desc, at)
+            .expect("a view")
+            .expect("a kept view");
+        let Some(HeldSource::Widened(widened, _)) = source else {
+            panic!("a widened source");
+        };
+        // SAFETY: a live resource.
+        let made = unsafe { resource.GetDesc() };
+        assert_eq!(made.Width, 4 * 16);
+        let float_one = 0x3f80_0000;
+        let want = |w| {
+            [
+                1000, 2000, 3000, w, 1003, 2003, 3003, w, 1006, 2006, 3006, w, 1009, 2009, 3009, w,
+            ]
+        };
+        assert_eq!(widened.read_host(16), want(float_one));
+
+        // SAFETY: a live heap; each later slot is one descriptor stride on.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let at_slot = |slot: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + slot * step as usize,
+        };
+        let (second_resource, second_source) =
+            buffer_srv(p as u64, len as u64, desc, at_slot(1))
+                .expect("a second view")
+                .expect("a second kept view");
+        let Some(HeldSource::Widened(second, _)) = second_source else {
+            panic!("a second widened source");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&widened, &second),
+            "one widened copy per range and w"
+        );
+        drop((second_resource, second));
+
+        let uint_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_UINT,
+            ..desc
+        };
+        let (uint_resource, uint_source) = buffer_srv(p as u64, len as u64, uint_desc, at_slot(2))
+            .expect("a uint view")
+            .expect("a kept uint view");
+        let Some(HeldSource::Widened(uint, _)) = uint_source else {
+            panic!("a widened uint source");
+        };
+        let sint_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_SINT,
+            ..desc
+        };
+        let (sint_resource, sint_source) = buffer_srv(p as u64, len as u64, sint_desc, at_slot(3))
+            .expect("a sint view")
+            .expect("a kept sint view");
+        let Some(HeldSource::Widened(sint, _)) = sint_source else {
+            panic!("a widened sint source");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&uint, &sint),
+            "integer formats share their widened copy"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&widened, &uint),
+            "float and integer w bits need distinct copies"
+        );
+        assert_eq!(uint.read_host(16), want(1));
+        assert_eq!(sint.read_host(16), want(1));
+
+        let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        // SAFETY: one 12-byte element of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr().cast::<u8>(), (p + 12) as *mut u8, 12) };
+        assert!(shadow.update(p, len) > 0, "the title write is copied");
+        let changed_want = |w| {
+            [
+                1000, 2000, 3000, w, 0x1111_1111, 0x2222_2222, 0x3333_3333, w, 1006, 2006, 3006, w,
+                1009, 2009, 3009, w,
+            ]
+        };
+        assert_eq!(widened.read_host(16), changed_want(float_one));
+        assert_eq!(uint.read_host(16), changed_want(1));
+        assert_eq!(sint.read_host(16), changed_want(1));
+
+        drop((
+            resource,
+            widened,
+            uint_resource,
+            uint,
+            sint_resource,
+            sint,
+            heap,
+            shadow,
+        ));
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// A placed texture's view the title writes into a heap is left null
