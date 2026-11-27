@@ -810,7 +810,7 @@ fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
             .ok_or(ShaderError::Malformed("truncated"))?;
         if rw != 0 {
             let key = (String::from_utf8_lossy(name).to_ascii_uppercase(), index);
-            *reads.entry(key).or_insert(0) |= rw;
+            *reads.reads.entry(key).or_insert(0) |= rw;
         }
     }
     Ok(reads)
@@ -902,10 +902,51 @@ fn link_prepared(
         return Ok((emit_mesh(&lower::KeptOutputs::new())?, None));
     };
     let full_ps = emit_pruned(ps_in, options, None)?;
-    let reads = pixel_input_reads(&full_ps.dxil)?;
-    let linked_ms = emit_mesh(&reads)?;
-    let linked_ps = emit_pruned(ps_in, options, Some(&reads))?;
-    Ok((linked_ms, Some(linked_ps)))
+    let mut reads = pixel_input_reads(&full_ps.dxil)?;
+    let link = |reads: &lower::KeptOutputs| -> Result<_, ShaderError> {
+        let linked_ms = emit_mesh(reads)?;
+        let linked_ps = emit_pruned(ps_in, options, Some(reads))?;
+        Ok((linked_ms, Some(linked_ps)))
+    };
+    // Both stages declare the mesh shader's outputs as `lower::Layout`
+    // plans them, smallest by Metal's count (`mesh_size`); clip distances
+    // that never clip are left out unless the pixel shader reads one. Where
+    // that does not translate (a merged row read with two modes, say), the
+    // outputs go by size as before.
+    let sig = |c: &Container, fourcc| match c.part(fourcc) {
+        Some(part) => signature(part.data),
+        None => Ok(Vec::new()),
+    };
+    let (outputs, inputs) = (sig(ms_in.c, FourCC::OSG1)?, sig(ps_in.c, FourCC::ISG1)?);
+    let live_clip = if pixel_reads_clip(&full_ps.dxil)? {
+        Vec::new()
+    } else {
+        lower::idle_clip(ms_in.p, ms_in.io, &outputs)
+    };
+    let unplanned = reads.clone();
+    reads.layout = Some(lower::plan_layout(
+        &reads.reads,
+        &outputs,
+        &inputs,
+        &live_clip,
+    ));
+    link(&reads).or_else(|_| link(&unplanned))
+}
+
+/// Whether an emitted pixel shader reads a clip distance (system value 2 at
+/// +12 of an `ISG1` element, the components read at +25).
+fn pixel_reads_clip(dxil: &[u8]) -> Result<bool, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(false);
+    };
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    Ok((0..count).any(|i| {
+        let at = base + 32 * i;
+        crate::dxbc::u32_at(part.data, at + 12).is_ok_and(|sv| sv == 2)
+            && part.data.get(at + 25).is_none_or(|&rw| rw != 0)
+    }))
 }
 
 struct EmitInput<'a> {
@@ -3351,11 +3392,14 @@ mod tests {
         // repacking still orders the outputs by size, which removes the
         // alignment holes: the layout then takes its packed size, over the
         // limit only when the packed size is.
-        let all_reads = widths
-            .into_iter()
-            .enumerate()
-            .map(|(row, width)| (("TEXCOORD".into(), row as u32), (1 << width) - 1))
-            .collect();
+        let all_reads = lower::KeptOutputs {
+            reads: widths
+                .into_iter()
+                .enumerate()
+                .map(|(row, width)| (("TEXCOORD".into(), row as u32), (1 << width) - 1))
+                .collect(),
+            layout: None,
+        };
         let still_over = emit_pruned(&ms_in, Options::default(), Some(&all_reads)).unwrap();
         assert_eq!(metal_mesh_output_bytes(&still_over.dxil), Some(packed));
         assert_eq!(
@@ -3459,9 +3503,9 @@ mod tests {
         };
         let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
         let reads = pixel_input_reads(&full_ps.dxil).unwrap();
-        assert_eq!(reads.len(), 2);
-        assert_eq!(reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
-        assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
+        assert_eq!(reads.reads.len(), 2);
+        assert_eq!(reads.reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
+        assert_eq!(reads.reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
 
         let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
         let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
@@ -4002,8 +4046,8 @@ mod tests {
             0x0000_0009,
             0xF800_00CF, // exp pos0 v4, v5, v6, v7
             0x0706_0504,
-            0xF800_08D1, // exp pos1 v7 (clip distance 1.0: kept) done
-            0x0707_0707,
+            0xF800_08D1, // exp pos1 v2 (clip distance 0.0 or 1.0: kept) done
+            0x0202_0202,
             0xBF81_0000, // s_endpgm
         ]);
         let ms_native = NativeProgram {
@@ -4117,6 +4161,46 @@ mod tests {
             assert!(linked_ps.is_some());
             assert_eq!(mesh_bytes(&linked_ms.dxil), Some(30_720));
             assert_eq!(mesh_aligned_bytes(&linked_ms.dxil), Some(32_768));
+
+            // Written as the constant 1.0, the distance never clips: linked,
+            // both stages leave it out (`lower::idle_clip`), and the vertex
+            // loses its 4 bytes and the 16 a clip distance adds.
+            if !scalar_first {
+                let mut idle = ms_native.clone();
+                let mut idle_words = words.clone();
+                let at = idle_words.len() - 2;
+                idle_words[at] = 0x0707_0707; // exp pos1 v7 (1.0) done
+                idle.code = idle_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let ip = ir::build(&idle.patched_code(), idle.wave64, idle.vgprs).unwrap();
+                let ist = structure::structure(&ip).unwrap();
+                let ires = resource::track(&ip, &idle.layout, idle.stage, Some(&ist)).unwrap();
+                let iio = io::raise(&ip, &idle).unwrap();
+                let outputs = signature(mc.part(FourCC::OSG1).unwrap().data).unwrap();
+                assert_eq!(
+                    lower::idle_clip(&ip, &iio, &outputs),
+                    vec![(("SV_CLIPDISTANCE".to_string(), 0), 0)]
+                );
+                assert!(lower::idle_clip(&mp, &mio, &outputs).is_empty());
+                let idle_in = EmitInput {
+                    c: &mc,
+                    native: &idle,
+                    p: &ip,
+                    st: &ist,
+                    io: &iio,
+                    res: &ires,
+                };
+                let (ms, ps) = link_prepared(&idle_in, Some(&ps_in), Options::default()).unwrap();
+                let clip = |dxil: &[u8], fourcc| {
+                    let c = Container::parse(dxil).unwrap();
+                    signature(c.part(fourcc).unwrap().data)
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.kind == 6)
+                };
+                assert!(!clip(&ms.dxil, FourCC::OSG1));
+                assert!(!clip(&ps.unwrap().dxil, FourCC::ISG1));
+                assert_eq!(mesh_aligned_bytes(&ms.dxil), Some(30_208));
+            }
 
             #[cfg(windows)]
             {
