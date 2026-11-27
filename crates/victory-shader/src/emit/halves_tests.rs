@@ -2055,6 +2055,73 @@ fn literal_wave64_programs_match_the_console_on_every_gpu() {
 }
 
 
+/// A number kept in VCC_HI on its way into a scalar load's offset: the
+/// console wave's first thread id, plus one, times 16 bytes, read from the
+/// structured buffer, and a branch on the dword read. Every lane stores the
+/// dword when it is nonzero.
+fn literal_vcc_hi_offset() -> Vec<u32> {
+    literal_program(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0x7E2A_0500, // v_readfirstlane_b32 s21, v0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0x8F6B_8415, // s_lshl_b32 vcc_hi, s21, 4
+        0x8817_806B, // s_or_b32 s23, vcc_hi, 0
+        0xF420_0616,
+        0x2E00_0000, // s_buffer_load_dword s24, s[44:47], s23
+        S_WAITCNT_LGKM,
+        0xBF07_8018, // s_cmp_lg_u32 s24, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E06_0218, // v_mov_b32 v3, s24
+    ])
+}
+
+/// VCC_HI read as a number keeps the whole-wave translation's group
+/// control flow uniform.
+#[test]
+fn literal_wave64_reads_a_number_in_vcc_hi_as_data() {
+    let words = literal_vcc_hi_offset();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 256).unwrap();
+    let names: Vec<_> = p
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter().map(|i| i.name()))
+        .collect();
+    for want in [
+        "v_readfirstlane_b32",
+        "s_add_u32",
+        "s_lshl_b32",
+        "s_or_b32",
+        "s_buffer_load_dword",
+        "s_cmp_lg_u32",
+        "s_cbranch_scc0",
+    ] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+    let n = native(&words, true, 64, 0);
+    let l = lower_halves(&n, true, true, true).expect("literal halves");
+    assert_eq!(l.wave_size, Some(32));
+}
+
+#[test]
+#[cfg(windows)]
+fn literal_wave64_vcc_hi_offset_matches_the_console_on_every_gpu() {
+    let failed = differences_with_buffer(
+        true,
+        &literal_vcc_hi_offset(),
+        64,
+        1,
+        &[7; 64],
+        0,
+        true,
+        true,
+        &[0, 0, 0, 0, 7, 0, 0, 0],
+    );
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// VOP2 opcode for `v_add_f16`.
 const V_ADD_F16: u32 = 0x32;
 
