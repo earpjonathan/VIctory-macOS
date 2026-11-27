@@ -5130,7 +5130,23 @@ mod tests {
         }
         let fast_ms = t_fast.elapsed().as_secs_f64() * 1000.0;
 
-        report("after passes", &mem_fast, &mem_legacy);
+        // Other tests forget views meanwhile (`VIEWS` is process-wide), and
+        // the legacy run ended before the fast one: a view forgotten in
+        // between is cleared in the fast heap only. Sync both again, back to
+        // back, until no view was forgotten during the two syncs, so both
+        // heaps reflect the same views when compared.
+        let mut tries = 0;
+        loop {
+            let forgot = views_forgot();
+            sync_all_pages(&host_legacy, &mem_legacy, false);
+            sync_all_pages(&host_fast, &mem_fast, true);
+            if views_forgot() == forgot {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 100, "views kept being forgotten during the final syncs");
+        }
+
         // Verify identical final made/kept state across all 65,536 slots.
         for i in 0..SLOTS {
             assert_eq!(host_fast.made(i), host_legacy.made(i), "made mismatch at slot {i}");
