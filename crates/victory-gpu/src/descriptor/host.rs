@@ -5061,6 +5061,11 @@ mod tests {
                 host.block_forgot[(i / SYNC_BLOCK_SLOTS) as usize].load(Ordering::Acquire),
                 host.made_is_nonzero(i),
             );
+            let views = crate::descriptor::VIEWS.read().unwrap();
+            let e = &views.list[r[1] as usize];
+            let kind = match &e.0 { crate::descriptor::View::Placed(..) => "placed", crate::descriptor::View::Shader(..) => "shader", crate::descriptor::View::Unordered(..) => "unordered", _ => "other" };
+            let idx = views.index.get(&e.0).copied();
+            eprintln!("DBG   list gen={} kind={kind} index_of_view={idx:?} res={:x?} free_has={} free_dups={}", e.1, e.0.resources(), views.free.iter().filter(|&&f| f == r[1]).count(), views.free.len() - views.free.iter().collect::<std::collections::BTreeSet<_>>().len());
         };
         let report = |when: &str, mem_fast: &[u8], mem_legacy: &[u8]| {
             let bad: Vec<u32> = (0..SLOTS).filter(|&j| host_fast.made(j) != host_legacy.made(j)).collect();
@@ -5147,6 +5152,7 @@ mod tests {
             assert!(tries < 100, "views kept being forgotten during the final syncs");
         }
 
+        report("after resync", &mem_fast, &mem_legacy);
         // Verify identical final made/kept state across all 65,536 slots.
         for i in 0..SLOTS {
             assert_eq!(host_fast.made(i), host_legacy.made(i), "made mismatch at slot {i}");
