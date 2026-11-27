@@ -3877,3 +3877,31 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+
+/// A program whose only cross-half operations are first-lane reads goes to
+/// halves for them (#522). Where halves cannot pass the read between them,
+/// here in a loop counted to the host wave's first lane, it is translated as
+/// before #522, each host wave reading its own first lane, rather than
+/// refused (its draws dropped).
+#[test]
+fn first_lane_reads_halves_refuse_fall_back_to_the_host_waves() {
+    let mbcnt = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
+    let first = [0x7E18_0500]; // v_readfirstlane_b32 s12, v0
+    let with_mbcnt = in_a_loop(&first, 12, Count::FirstLane);
+    let at = with_mbcnt
+        .windows(2)
+        .position(|w| w == mbcnt)
+        .expect("in_a_loop's v_mbcnt");
+    let words = [&with_mbcnt[..at], &with_mbcnt[at + 2..]].concat();
+    for threads in [64, 128, 256] {
+        assert_eq!(refusal(&words, threads, 0), "translated", "{threads} threads");
+        // With console lanes asked for as well, the program stays in halves,
+        // and the read is still refused there.
+        let why = refusal(&with_mbcnt, threads, 0);
+        assert!(
+            why.contains("a first-lane read of a value that may differ between 32-lane halves"),
+            "{threads} threads: {why}"
+        );
+    }
+}
