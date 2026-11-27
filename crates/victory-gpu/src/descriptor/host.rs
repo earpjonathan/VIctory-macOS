@@ -5046,9 +5046,34 @@ mod tests {
             }
         };
 
+        let dump = |tag: &str, host: &HostHeap, mem: &[u8], i: u32| {
+            let off = i as usize * 32;
+            let r = [0, 4, 8].map(|o| u32::from_le_bytes(mem[off + o..off + o + 4].try_into().unwrap()));
+            let made = host.made.lock().unwrap()[i as usize];
+            let mut raw = [0u8; 12];
+            let readable = crate::host::read_into(mem[off..].as_ptr(), &mut raw);
+            eprintln!(
+                "DBG {tag} slot {i}: rec={r:x?} made={made:x} synced={:x} ready={:x} cur={} forgot={} block_forgot={} nz={} rpm={readable}",
+                host.synced[i as usize].load(Ordering::Acquire),
+                host.ready[i as usize].load(Ordering::Acquire),
+                crate::descriptor::view_gen_current(r[1], r[2]),
+                views_forgot(),
+                host.block_forgot[(i / SYNC_BLOCK_SLOTS) as usize].load(Ordering::Acquire),
+                host.made_is_nonzero(i),
+            );
+        };
+        let report = |when: &str, mem_fast: &[u8], mem_legacy: &[u8]| {
+            let bad: Vec<u32> = (0..SLOTS).filter(|&j| host_fast.made(j) != host_legacy.made(j)).collect();
+            eprintln!("DBG {when}: made mismatches={} first={:?} last={:?}", bad.len(), bad.first(), bad.last());
+            if let Some(&i) = bad.first() {
+                dump("fast", &host_fast, mem_fast, i);
+                dump("legacy", &host_legacy, mem_legacy, i);
+            }
+        };
         // Initial warm sync so steady-state slots (including 20,000 placed-left-null) are populated.
         sync_all_pages(&host_legacy, &mem_legacy, false);
         sync_all_pages(&host_fast, &mem_fast, true);
+        report("after warm sync", &mem_fast, &mem_legacy);
         assert!(host_fast.kept(0), "benchmark buffer SRVs are real host views");
         assert!(!host_fast.kept(12_288), "placed textures remain null on sync");
 
@@ -5105,6 +5130,7 @@ mod tests {
         }
         let fast_ms = t_fast.elapsed().as_secs_f64() * 1000.0;
 
+        report("after passes", &mem_fast, &mem_legacy);
         // Verify identical final made/kept state across all 65,536 slots.
         for i in 0..SLOTS {
             assert_eq!(host_fast.made(i), host_legacy.made(i), "made mismatch at slot {i}");
