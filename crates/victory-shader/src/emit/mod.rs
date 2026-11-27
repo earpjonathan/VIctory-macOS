@@ -260,6 +260,7 @@ mod lower;
 mod mark_tests;
 #[cfg(test)]
 mod mesh_index_tests;
+mod mesh_size;
 mod deltas;
 mod rect;
 pub use container::sign as sign_container;
@@ -629,34 +630,10 @@ impl MeshOutputs {
     }
 }
 
-/// The bytes of one Metal mesh vertex (`vertex`) or primitive for its
-/// allocated signature elements, `(DXIL semantic kind, columns)` in element
-/// order, as D3DMetal (4.0 beta 3) lays them out: measured with the sizes its
-/// `Total mesh size` errors give. A vertex starts with its clip distances, 4
-/// bytes each, then `SV_Position` at the next multiple of 16. Then every other
-/// element in element order (the order of the IDs and of `PSV0`, not the
-/// registers of `OSG1`), each aligned to its own size `4 * cols` (a
-/// 3-component one to 12): clip and cull distances among them, which
-/// D3DMetal passes on as values too.
-fn metal_mesh_record_bytes(elements: &[(u8, u8)], vertex: bool) -> u32 {
-    let place = |end: u32, size: u32| end.next_multiple_of(size) + size;
-    let mut end = 0;
-    if vertex {
-        let clip = elements.iter().filter(|e| e.0 == 6).map(|e| u32::from(e.1));
-        end = place(4 * clip.sum::<u32>(), 16);
-    }
-    for &(kind, cols) in elements {
-        if !(vertex && kind == 3) && cols > 0 {
-            end = place(end, 4 * u32::from(cols));
-        }
-    }
-    end
-}
-
 /// Output bytes as Apple's Metal counts them for a translated mesh shader
-/// container ([`metal_mesh_record_bytes`] of the allocated output and
-/// primitive elements `PSV0` lists in element order), multiplied by the
-/// declared maxima.
+/// container: the measured rule ([`mesh_size`]) on the allocated output and
+/// primitive elements `PSV0` lists in element order, times the declared
+/// maxima (vertices in fours).
 pub fn mesh_aligned_bytes(dxil: &[u8]) -> Option<u32> {
     let c = Container::parse(dxil).ok()?;
     let psv = c.part(FourCC::PSV0)?.data;
@@ -701,10 +678,12 @@ pub fn mesh_aligned_bytes(dxil: &[u8]) -> Option<u32> {
     };
     let vertex = elements(inputs..inputs + outputs)?;
     let primitive = elements(inputs + outputs..inputs + outputs + prims)?;
-    Some(
-        half(12) * metal_mesh_record_bytes(&vertex, true)
-            + half(14) * metal_mesh_record_bytes(&primitive, false),
-    )
+    Some(mesh_size::total_bytes(
+        mesh_size::record_bytes(&vertex),
+        mesh_size::record_bytes(&primitive),
+        half(12),
+        half(14),
+    ))
 }
 
 /// The declared outputs of a translated mesh shader: the counts from its
