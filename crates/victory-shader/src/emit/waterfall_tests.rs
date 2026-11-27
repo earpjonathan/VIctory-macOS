@@ -14,8 +14,15 @@ use crate::{io, ir, resource, structure};
 
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
-/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
+/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1, with one
+/// access by each lane's own heap index.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+/// `build` for a program with `nonuniform` accesses by each lane's own heap
+/// index: 0 where every lane's descriptor is the same.
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -80,8 +87,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         view_marks: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    // No wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -273,7 +280,9 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 #[test]
 fn lanes_sample_a_descriptor_moved_under_the_exec_their_waterfall_starts_with() {
     let words = crate::resource::tests::waterfall_narrowed_wave32();
-    let shader = build(&words, false);
+    // Every lane's descriptor is the first texture's, so the waterfall is
+    // one uniform access.
+    let shader = build_with(&words, false, 0);
     for (label, red) in sampled(&shader) {
         // Lanes below 16 moved the first texture's descriptor and sample
         // it; the others keep v12's 0.
@@ -289,7 +298,7 @@ const RECORDS_ONLY_WAVE32: &[u32] = &[
     0xBE84_0300, // s_mov_b32 s4, s0
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0602,
-    0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
+    0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], null
     0xF408_0A02,
     0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
     0x3420_0082, // v_lshlrev_b32 v16, 2, v0
@@ -313,14 +322,14 @@ fn a_buffer_descriptor_read_only_for_its_record_count_gives_the_views_elements()
         .collect::<Vec<_>>()
         .join("\n");
     for want in [
-        "s_load_dwordx4 s[24:27], s[4:5], 0x000000",
+        "s_load_dwordx4 s[24:27], s[4:5], null",
         "s_load_dwordx4 s[40:43], s[4:5], 0x000040",
         "v_mov_b32 v1, s26",
         "buffer_store_dword v1, v16, s[40:43], 0 offen",
     ] {
         assert!(all.contains(want), "{want:?} not in:\n{all}");
     }
-    let shader = build(RECORDS_ONLY_WAVE32, true);
+    let shader = build_with(RECORDS_ONLY_WAVE32, true, 0);
     let first: Vec<u32> = (0..24).collect();
     let second = [0u32; 4];
     let views = [
