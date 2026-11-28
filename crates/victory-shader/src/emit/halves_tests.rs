@@ -11,15 +11,19 @@
 
 #[cfg(windows)]
 use super::host::{Dispatch, Host, Root, Stride, View};
+
 use super::lower;
+
 #[cfg(windows)]
 use super::validator;
+
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{gfx10, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
 const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
@@ -247,6 +251,33 @@ fn the_test_programs_are_what_their_comments_say() {
                 "v_cndmask_b32 v6, 0, 1, s[20:21]",
                 "v_mov_b32 v7, v0 quad_perm:[1,0,3,2]",
                 "buffer_store_dword v7, v16, s[40:43], 0 offen offset:24",
+            ],
+        ),
+        (
+            sum_after_a_loop_lanes_leave(),
+            &[
+                "v_and_b32 v5, 3, v0",
+                "v_mov_b32 v6, 0",
+                "s_mov_b64 s[4:5], exec",
+                "v_cmp_lt_u32 vcc, v6, v5",
+                "s_and_b64 exec, exec, vcc",
+                "s_cbranch_execz",
+                "v_add_nc_u32 v6, 1, v6",
+                "s_branch",
+                "s_mov_b64 exec, s[4:5]",
+                "v_cvt_f32_u32 v3, v6",
+            ],
+        ),
+        (
+            loops_sharing_a_latch(),
+            &[
+                "s_add_u32 s22, s22, 1",
+                "s_cmp_lt_u32 s22, 3",
+                "s_add_u32 s20, s20, 1",
+                "s_cmp_gt_u32 s20, 2",
+                "s_mov_b32 s22, 0",
+                "s_add_u32 s21, s21, 1",
+                "v_mov_b32 v1, s21",
             ],
         ),
         (
@@ -555,8 +586,11 @@ fn in_a_loop(body: &[u32], result: u32, count: Count) -> Vec<u32> {
 
 /// VOP2 opcodes of the operations [`reduction`] takes.
 const V_ADD_F32: u32 = 0x03;
+
 const V_MIN_U32: u32 = 0x13;
+
 const V_MAX_U32: u32 = 0x14;
+
 /// `v_mov_b32 v3, v0`.
 const V_MOV_V3_V0: u32 = 0x7E06_0300;
 
@@ -1616,7 +1650,9 @@ const fn permlanex16(fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
 
 /// The selectors: every nibble of `s8` is odd and every one of `s9` is even.
 const PERM_LOW: u32 = 0x1357_9BDF;
+
 const PERM_HIGH: u32 = 0x2468_ACE0;
+
 /// What `v1` holds before an instruction that may leave it alone.
 const PERM_OLD: u32 = 0xAAAA;
 
@@ -2127,7 +2163,6 @@ fn literal_wave64_programs_match_the_console_on_every_gpu() {
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }
-
 
 /// A number kept in VCC_HI on its way into a scalar load's offset: the
 /// console wave's first thread id, plus one, times 16 bytes, read from the
@@ -3616,14 +3651,17 @@ const MASK_LANES_8_9: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0684, // v_cmp_eq_u32 vcc, 4, v3
 ];
+
 const MASK_LANES_40_41: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0694, // v_cmp_eq_u32 vcc, 20, v3
 ];
+
 const MASK_LANES_12_44: [u32; 2] = [
     0x3606_009F, // v_and_b32 v3, 31, v0
     0x7D84_068C, // v_cmp_eq_u32 vcc, 12, v3
 ];
+
 const MASK_EMPTY: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_06C0, // v_cmp_eq_u32 vcc, 64, v3
@@ -4019,7 +4057,6 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     }
 }
 
-
 /// A program whose only cross-half operations are first-lane reads goes to
 /// halves for them (#522). Where halves cannot pass the read between them,
 /// here in a loop counted to the console wave's first lane, it is refused,
@@ -4363,34 +4400,6 @@ fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu()
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-            ],
-        ),
-        (
-            sum_after_a_loop_lanes_leave(),
-            &[
-                "v_and_b32 v5, 3, v0",
-                "v_mov_b32 v6, 0",
-                "s_mov_b64 s[4:5], exec",
-                "v_cmp_lt_u32 vcc, v6, v5",
-                "s_and_b64 exec, exec, vcc",
-                "s_cbranch_execz",
-                "v_add_nc_u32 v6, 1, v6",
-                "s_branch",
-                "s_mov_b64 exec, s[4:5]",
-                "v_cvt_f32_u32 v3, v6",
-            ],
-        ),
-        (
-            loops_sharing_a_latch(),
-            &[
-                "s_add_u32 s22, s22, 1",
-                "s_cmp_lt_u32 s22, 3",
-                "s_add_u32 s20, s20, 1",
-                "s_cmp_gt_u32 s20, 2",
-                "s_mov_b32 s22, 0",
-                "s_add_u32 s21, s21, 1",
-                "v_mov_b32 v1, s21",
-
 /// Each lane counts to the low two bits of its thread id in a loop it leaves
 /// on its own, whose back edge is unconditional (`s_branch`): lowering caps
 /// that back edge at the loop iteration limit. Then the console compiler's
@@ -4441,10 +4450,6 @@ fn loops_sharing_a_latch() -> Vec<u32> {
     w.extend(store(1, 0));
     w.push(S_ENDPGM);
     w
-}
-
-
-    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// A reduction after a loop the lanes leave one by one, whose back edge is
@@ -4504,3 +4509,5 @@ fn a_branch_back_to_two_loops_runs_in_whole_wave_halves() {
 fn a_branch_back_to_two_loops_matches_the_console_on_every_gpu() {
     let words = loops_sharing_a_latch();
     let failed = differences_in(true, &words, 64, 1, &[6; 64], 0, false, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
